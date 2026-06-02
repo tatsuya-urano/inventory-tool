@@ -112,79 +112,78 @@ if view.empty:
     st.warning("該当SKUなし")
     st.stop()
 
-# 入力欄は空欄スタート。数字を入れた行だけ反映(空欄=現在庫のまま)
-# ※現在庫を初期値にすると、スマホで「90」と打つと既存桁の後ろに付いて「990」等になる
-view["実カウント"] = pd.array([pd.NA] * len(view), dtype="Int64")
+# data_editorはスマホで数値が累積・消せない不具合があるため、st.formの
+# 行ごとnumber_inputに変更。formは送信ボタンを押すまで再実行しないので、
+# 入力途中で数字が勝手に足される/消せない問題が起きない。
+MAX_ROWS = 120
+if len(view) > MAX_ROWS:
+    st.warning(
+        f"{len(view)}件は一度に表示するには多すぎます。"
+        "上の「小分類で絞り込み」かSKU検索で絞ってください。"
+    )
+    st.stop()
 
-st.caption(f"{len(view)}件　実カウント欄に実数を入力した行だけ、その数になるよう月初在庫(G)を逆算反映(空欄はスキップ)")
+st.caption(f"{len(view)}件　各SKUに実数を入力 → 「反映」を押した時だけ保存。"
+           "空欄の行はスキップ(現在庫のまま)。途中で押しても累積しません")
 
-edited = st.data_editor(
-    view[["小分類", "SKU", "現在庫", "実カウント"]],
-    use_container_width=True,
-    hide_index=True,
-    height=520,
-    num_rows="fixed",
-    # SKU・現在庫は非表示(保存の照合/逆算用に内部データとしては保持)
-    # 2列だけ&width小で、横スクロールなしに一画面へ収める
-    column_order=("小分類", "実カウント"),
-    column_config={
-        "小分類": st.column_config.TextColumn(disabled=True, width="small"),
-        "SKU": st.column_config.TextColumn(disabled=True),
-        "現在庫": st.column_config.NumberColumn("現在庫", disabled=True, format="%d", width="small"),
-        "実カウント": st.column_config.NumberColumn("🟢実カウント", min_value=0, step=1, format="%d", width="small"),
-    },
-    key="mob_count_editor",
-)
-
-# 変更行を抽出して逆算
-emap = dict(zip(edited["SKU"].astype(str), edited["実カウント"]))
 gmap = dict(zip(view["SKU"], view["_G"]))
 fmap = dict(zip(view["SKU"], view["現在庫"]))
-changes = []
-for sku, newc in emap.items():
-    if newc is None or pd.isna(newc):
-        continue
-    newc = int(newc)
-    f_old = int(fmap.get(sku, 0))
-    if newc == f_old:
-        continue
-    g_new = int(gmap.get(sku, 0)) + (newc - f_old)
-    changes.append((sku, newc, g_new))
 
-st.markdown(f"### ✏️ 変更 {len(changes)} 件")
-if changes:
-    st.dataframe(
-        pd.DataFrame(changes, columns=["SKU", "実カウント", "新・月初(G)"]),
-        hide_index=True, use_container_width=True,
-    )
-
-if st.button(f"💾 {len(changes)}件を在庫に反映", type="primary",
-             use_container_width=True, disabled=not changes):
-    try:
-        ss = sheets.get_spreadsheet()
-        ws = ss.worksheet("04_在庫管理")
-        codes = ws.col_values(1)
-        row_of = {}
-        for i, c in enumerate(codes, start=1):
-            if i >= 7 and c.strip():
-                row_of.setdefault(c.strip(), i)
-        reqs, miss = [], []
-        for sku, newc, g_new in changes:
-            row = row_of.get(sku)
-            if not row:
-                miss.append(sku)
-                continue
-            reqs.append({"range": f"G{row}", "values": [[g_new]]})
-        if reqs:
-            sheets.safe_batch_update(ws, reqs, value_input_option="USER_ENTERED")
-            sheets._invalidate_one("04_在庫管理")
-        st.success(
-            f"✅ {len(reqs)}件反映。自社倉庫(F)が実カウントに一致します"
-            + (f" / ⚠未マッチ {len(miss)}件" if miss else "")
+with st.form("mob_count_form", clear_on_submit=False):
+    for _, row in view.iterrows():
+        sku = row["SKU"]
+        f_old = int(row["現在庫"])
+        small = row["小分類"] or "（小分類なし）"
+        st.number_input(
+            f"{small}　|　{sku}　(現在 {f_old})",
+            min_value=0, step=1, value=None,
+            key=f"mob_cnt_{sku}",
         )
-        st.balloons()
-    except Exception as e:
-        st.error(f"反映失敗: {e}")
+    submitted = st.form_submit_button(
+        "💾 入力した行を在庫に反映", type="primary", use_container_width=True)
+
+if submitted:
+    # 入力値を集計して逆算 (空欄=None はスキップ、現在庫と同じ値もスキップ)
+    changes = []
+    for sku in view["SKU"]:
+        newc = st.session_state.get(f"mob_cnt_{sku}")
+        if newc is None:
+            continue
+        newc = int(newc)
+        f_old = int(fmap.get(sku, 0))
+        if newc == f_old:
+            continue
+        g_new = int(gmap.get(sku, 0)) + (newc - f_old)
+        changes.append((sku, newc, g_new))
+
+    if not changes:
+        st.info("入力された変更がありません(空欄か現在庫と同じ値のみ)")
+    else:
+        try:
+            ss = sheets.get_spreadsheet()
+            ws = ss.worksheet("04_在庫管理")
+            codes = ws.col_values(1)
+            row_of = {}
+            for i, c in enumerate(codes, start=1):
+                if i >= 7 and c.strip():
+                    row_of.setdefault(c.strip(), i)
+            reqs, miss = [], []
+            for sku, newc, g_new in changes:
+                r_idx = row_of.get(sku)
+                if not r_idx:
+                    miss.append(sku)
+                    continue
+                reqs.append({"range": f"G{r_idx}", "values": [[g_new]]})
+            if reqs:
+                sheets.safe_batch_update(ws, reqs, value_input_option="USER_ENTERED")
+                sheets._invalidate_one("04_在庫管理")
+            st.success(
+                f"✅ {len(reqs)}件反映。自社倉庫(F)が実カウントに一致します"
+                + (f" / ⚠未マッチ {len(miss)}件" if miss else "")
+            )
+            st.balloons()
+        except Exception as e:
+            st.error(f"反映失敗: {e}")
 
 st.markdown("---")
-st.caption("📌 実カウント=倉庫の実物数。変えた行だけが反映対象です(現在庫と同じ行はスキップ)。Amazon専売(AMA専売)は自社倉庫に無いので非表示")
+st.caption("📌 実カウント=倉庫の実物数。入力した行だけが反映対象(空欄・現在庫と同じ値はスキップ)。Amazon専売(AMA専売)は自社倉庫に無いので非表示")
