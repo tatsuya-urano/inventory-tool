@@ -34,7 +34,15 @@ st.title("📱 発注→到着→納品")
 st.caption("Rakumartの今の状況を見るだけ(入力なし)")
 
 with st.spinner("読込中..."):
-    inv_df = sheets.load_inventory()
+    try:
+        inv_df = sheets.load_inventory()
+    except Exception as e:
+        st.error("📡 在庫データの取得に失敗しました（サーバー混雑かも）。")
+        st.caption(f"詳細: {type(e).__name__}")
+        if st.button("🔄 もう一度読み込む"):
+            sheets._invalidate_one("04_在庫管理")
+            st.rerun()
+        st.stop()
 
 if inv_df.empty:
     st.error("在庫データ読込失敗")

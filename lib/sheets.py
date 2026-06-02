@@ -160,27 +160,42 @@ def _values_to_df(all_values, header_row, data_start_row, auto_detect_keywords=N
 # ============================================================
 @st.cache_data(ttl=config.CACHE_TTL_SECONDS, show_spinner=False)
 def _fetch_raw(sheet_name: str):
-    """シート1枚を取得（個別キャッシュ + ディスクキャッシュ層）"""
-    # 1) ディスクキャッシュが新鮮ならそれを返す（API叩かず即返却）
-    disk_values, disk_age = _disk_cache_load(sheet_name)
-    if disk_values is not None and disk_age < _DISK_CACHE_TTL_SEC:
-        return disk_values
+    """シート1枚を取得(メモリキャッシュのみ。ディスクキャッシュは使わない)
 
-    # 2) API取得を試みる
+    ディスクキャッシュは古いARRAYFORMULA計算結果を保持してしまう副作用があるため無効化。
+    APIエラー時の保険として、ディスクキャッシュは「フォールバック用」だけ残す。
+
+    503等の一時エラーは指数バックオフでリトライ。
+    """
+    import time as _time
+    sh = get_spreadsheet()
     try:
-        sh = get_spreadsheet()
+        ws = sh.worksheet(sheet_name)
+    except gspread.exceptions.WorksheetNotFound:
+        return None
+
+    last_exc = None
+    for attempt in range(4):
         try:
-            ws = sh.worksheet(sheet_name)
-        except gspread.exceptions.WorksheetNotFound:
-            return None
-        values = ws.get_all_values()
-        _disk_cache_save(sheet_name, values)
-        return values
-    except Exception:
-        # API取得失敗(429/503等) → 古いディスクキャッシュでもあれば返す
-        if disk_values is not None:
-            return disk_values
-        raise
+            values = ws.get_all_values()
+            _disk_cache_save(sheet_name, values)
+            return values
+        except gspread.exceptions.APIError as e:
+            last_exc = e
+            status = getattr(e, "response", None) and getattr(e.response, "status_code", None)
+            if status in (429, 500, 502, 503, 504):
+                _time.sleep(min(2 ** attempt * 2, 8))  # 2, 4, 8, 8秒(最大22秒)
+                continue
+            break
+        except Exception as e:
+            last_exc = e
+            break
+
+    # 全リトライ失敗 → 古いディスクキャッシュをフォールバック
+    disk_values, _ = _disk_cache_load(sheet_name)
+    if disk_values is not None:
+        return disk_values
+    raise last_exc
 
 
 @st.cache_data(ttl=config.CACHE_TTL_SECONDS)
@@ -191,10 +206,107 @@ def load_inventory() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=config.CACHE_TTL_SECONDS)
-def load_sales() -> pd.DataFrame:
-    """05_売上管理（ヘッダ自動検出）"""
+def load_sales(include_archive: bool = False) -> pd.DataFrame:
+    """05_売上管理 を読込
+
+    シート構造:
+      行1: タイトル
+      行2: ↓ 7行目から実データ の説明
+      行3-6: サマリブロック
+      行7以降: データ
+    ヘッダー列名はコード内で固定定義(スプシ2行目を参照しない)
+
+    include_archive=True の場合、月別アーカイブシート (05_売上_YYYY-MM) も
+    自動で結合して返す。月次サマリや過去履歴を見るページで使う。
+    """
+    SALES_COLUMNS = [
+        "日付", "モール", "注文番号", "商品コード", "商品名", "SKU",
+        "数量", "単価", "売上", "原価", "手数料", "送料",
+        "楽天ポイント費用", "楽天クーポン費用", "利益額", "利益率", "備考",
+    ]
     values = _fetch_raw(config.SHEET_SALES)
-    return _values_to_df(values, None, None, auto_detect_keywords=["日付"])
+    if not values or len(values) < 8:
+        df = pd.DataFrame(columns=SALES_COLUMNS)
+    else:
+        # 8行目以降(0-indexedで7以降)を読み込み (7行目はデータヘッダー)
+        data = values[7:]
+        # 列数を揃える
+        max_cols = max(len(SALES_COLUMNS), max((len(r) for r in data), default=0))
+        cols = SALES_COLUMNS + [f"col_{i}" for i in range(len(SALES_COLUMNS), max_cols)]
+        normalized = [r + [""] * (max_cols - len(r)) for r in data]
+        df = pd.DataFrame(normalized, columns=cols[:max_cols])
+        # 日付列が空の行を除外
+        if "日付" in df.columns:
+            df = df[df["日付"].astype(str).str.strip() != ""]
+        df = df.reset_index(drop=True)
+    if not include_archive:
+        return df
+
+    # メインスプシ内のアーカイブシート列挙
+    try:
+        sh = get_spreadsheet()
+        archive_names = sorted([
+            ws.title for ws in sh.worksheets()
+            if ws.title.startswith("05_売上_") and ws.title != config.SHEET_SALES
+        ])
+    except Exception:
+        archive_names = []
+
+    dfs = [df] if not df.empty else []
+    for name in archive_names:
+        try:
+            arc_values = _fetch_raw(name)
+            if not arc_values or len(arc_values) < 2:
+                continue
+            arc_data = arc_values[1:]
+            max_cols = max(len(SALES_COLUMNS), max((len(r) for r in arc_data), default=0))
+            cols = SALES_COLUMNS + [f"col_{i}" for i in range(len(SALES_COLUMNS), max_cols)]
+            arc_norm = [r + [""] * (max_cols - len(r)) for r in arc_data]
+            arc_df = pd.DataFrame(arc_norm, columns=cols[:max_cols])
+            if "日付" in arc_df.columns:
+                arc_df = arc_df[arc_df["日付"].astype(str).str.strip() != ""]
+            if not arc_df.empty:
+                dfs.append(arc_df.reset_index(drop=True))
+        except Exception:
+            continue
+
+    # 別スプシのアーカイブも読込
+    try:
+        archive_ss_id = st.secrets.get("archive", {}).get("sales_spreadsheet_id", "")
+    except Exception:
+        archive_ss_id = ""
+    if archive_ss_id:
+        try:
+            gc = get_client()
+            arc_sh = gc.open_by_key(archive_ss_id)
+            for ws in arc_sh.worksheets():
+                if not ws.title.startswith("05_売上_"):
+                    continue
+                try:
+                    arc_values = ws.get_all_values()
+                except Exception:
+                    continue
+                if not arc_values or len(arc_values) < 2:
+                    continue
+                arc_data = arc_values[1:]
+                max_cols = max(len(SALES_COLUMNS), max((len(r) for r in arc_data), default=0))
+                cols = SALES_COLUMNS + [f"col_{i}" for i in range(len(SALES_COLUMNS), max_cols)]
+                arc_norm = [r + [""] * (max_cols - len(r)) for r in arc_data]
+                arc_df = pd.DataFrame(arc_norm, columns=cols[:max_cols])
+                if "日付" in arc_df.columns:
+                    arc_df = arc_df[arc_df["日付"].astype(str).str.strip() != ""]
+                if not arc_df.empty:
+                    dfs.append(arc_df.reset_index(drop=True))
+        except Exception:
+            pass
+
+    if not dfs:
+        return df
+    if len(dfs) == 1:
+        return dfs[0]
+    # 列を揃えてconcat
+    merged = pd.concat(dfs, ignore_index=True, sort=False)
+    return merged
 
 
 @st.cache_data(ttl=config.CACHE_TTL_SECONDS)
@@ -250,21 +362,39 @@ def preload_all_sheets():
 # キャッシュ管理
 # ============================================================
 def clear_all_caches():
-    """全キャッシュクリア（重い、緊急時のみ）"""
+    """全キャッシュクリア（重い、緊急時のみ）
+
+    ディスクキャッシュも全削除
+    """
     st.cache_data.clear()
+    # ディスクキャッシュ全削除
+    try:
+        if _DISK_CACHE_DIR.exists():
+            for f in _DISK_CACHE_DIR.glob("*.json"):
+                try:
+                    f.unlink()
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
 
 def refresh_sheet(sheet_name: str):
-    """指定シート1枚だけ強制再取得（他のシートは保持）"""
+    """指定シート1枚だけ強制再取得（他のシートは保持）
+
+    重要: ディスクキャッシュも削除して、確実にAPIから最新取得させる
+    """
     sh = get_spreadsheet()
     try:
         ws = sh.worksheet(sheet_name)
     except gspread.exceptions.WorksheetNotFound:
         return False
 
-    # cache_data を 全部クリア → そのシート分だけ次回取得時に再ロード
-    # 個別キーのクリアは streamlit に機能ないので、対象 load 関数だけクリア
-    _fetch_raw.clear()  # 全 _fetch_raw キャッシュをクリア（書込シート以外も）
+    # ディスクキャッシュ削除(これが無いと古いデータが残る)
+    _disk_cache_delete(sheet_name)
+
+    # メモリキャッシュもクリア
+    _fetch_raw.clear()
     if sheet_name == config.SHEET_INVENTORY:
         load_inventory.clear()
     elif sheet_name == config.SHEET_SALES:

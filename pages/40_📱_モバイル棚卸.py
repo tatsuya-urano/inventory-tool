@@ -1,7 +1,11 @@
-"""📱 モバイル棚卸 — スマホ最適化
+"""📱 モバイル棚卸 — 小分類順の一覧入力(スマホ最適化)
 
-SKU検索 → 自社倉庫(F列) or 月初(G列) を直接書き込み
-1SKUずつ大きなボタンで操作
+小分類を降順で並べ、各SKUの「実カウント数」を入力 → 04のG列(月初在庫)を
+逆算して 自社倉庫(F) が実カウントと一致するよう反映する。
+
+逆算ロジック(列移設に強い):
+  F = G + (I - J - 当月売上 - Z - S)  ← G以外はGに依存しない
+  よって G_new = G_old + (実カウント - 現在のF) とすれば F_new = 実カウント。
 """
 import streamlit as st
 import pandas as pd
@@ -11,175 +15,164 @@ from lib import sheets, ui
 st.set_page_config(page_title="モバイル棚卸", page_icon="📱", layout="centered")
 ui.sidebar_common()
 
-# モバイル用大きめCSS
 st.markdown("""
 <style>
     .stButton>button {
-        height: 56px !important;
-        font-size: 20px !important;
+        height: 52px !important;
+        font-size: 18px !important;
         font-weight: 700 !important;
     }
     .stTextInput input, .stNumberInput input {
-        font-size: 20px !important;
-        height: 50px !important;
-    }
-    .big-stock {
-        font-size: 48px;
-        font-weight: 800;
-        text-align: center;
-        color: #C76E47;
-        margin: 12px 0;
-    }
-    .sku-card {
-        background: #FFF7F0;
-        border: 2px solid #E8A574;
-        border-radius: 12px;
-        padding: 16px;
-        margin: 12px 0;
+        font-size: 18px !important;
+        height: 46px !important;
     }
 </style>
 """, unsafe_allow_html=True)
 
 st.title("📱 モバイル棚卸")
-st.caption("スマホで在庫を直接入力")
+st.caption("小分類順に実在庫を入力 → 自社倉庫に反映")
 
 with st.spinner("読込中..."):
-    inv_df = sheets.load_inventory()
-    master_df = sheets.load_master()
+    try:
+        inv_df = sheets.load_inventory()
+    except Exception as e:
+        st.error("📡 在庫データの取得に失敗しました（サーバー混雑かも）。")
+        st.caption(f"詳細: {type(e).__name__}")
+        if st.button("🔄 もう一度読み込む"):
+            sheets._invalidate_one("04_在庫管理")
+            st.rerun()
+        st.stop()
+    # マスタは小分類の取得だけに使う補助データ。失敗しても棚卸は続行
+    try:
+        master_df = sheets.load_master()
+    except Exception:
+        master_df = pd.DataFrame()
+        st.warning("⚠ 小分類を取得できませんでした（サーバー混雑）。並びは小分類なしになります。")
 
 if inv_df.empty:
     st.error("在庫データ読込失敗")
     st.stop()
 
-# ===========================================================
-# SKU検索
-# ===========================================================
-search = st.text_input("🔍 SKU or タイトル検索", key="mob_search", placeholder="例: osatukinkoblack")
-
-if not search.strip():
-    st.info("SKU or タイトルの一部を入力してください")
-    st.stop()
-
-# 部分一致検索
 code_col = inv_df.columns[0]
-title_col = inv_df.columns[1] if len(inv_df.columns) > 1 else None
+title_col = inv_df.columns[1] if len(inv_df.columns) > 1 else code_col
 
-mask = inv_df[code_col].astype(str).str.contains(search, case=False, na=False)
-if title_col:
-    mask |= inv_df[title_col].astype(str).str.contains(search, case=False, na=False)
-hits = inv_df[mask].head(10)
 
-if hits.empty:
-    st.warning(f"「{search}」にマッチするSKUなし")
-    st.stop()
-
-st.caption(f"{len(hits)}件ヒット(最大10件)")
-
-# ===========================================================
-# SKU選択
-# ===========================================================
-options = []
-for _, r in hits.iterrows():
-    code = str(r[code_col]).strip()
-    title = str(r[title_col]).strip() if title_col else ""
-    options.append(f"{code} | {title[:30]}")
-
-selected = st.radio("SKU選択", options, key="mob_selected_sku")
-selected_code = selected.split(" | ")[0]
-
-# 詳細表示
-inv_row = inv_df[inv_df[code_col].astype(str).str.strip() == selected_code]
-if inv_row.empty:
-    st.error("SKU不明")
-    st.stop()
-r = inv_row.iloc[0]
-
-# 現在値
 def _f(v):
     try:
         return int(float(str(v).replace(",", "").replace("¥", "").strip() or 0))
     except (ValueError, TypeError):
         return 0
 
-cur_fba = _f(r.iloc[3]) if len(r) > 3 else 0
-cur_jisha = _f(r.iloc[5]) if len(r) > 5 else 0  # F自社倉庫(計算値)
-cur_month_init = _f(r.iloc[6]) if len(r) > 6 else 0  # G月初
-cur_avail = _f(r.iloc[7]) if len(r) > 7 else 0  # H販売可能
-cur_pending = _f(r.iloc[11]) if len(r) > 11 else 0  # L発注済
 
-st.markdown(f"""
-<div class="sku-card">
-<div style="font-weight:700; font-size:18px;">{selected_code}</div>
-<div style="color:#666; font-size:14px; margin:4px 0;">{str(r[title_col])[:40] if title_col else ''}</div>
-</div>
-""", unsafe_allow_html=True)
+# 商品コード → 小分類 (マスタ E列=index4)
+small_map = {}
+if not master_df.empty and len(master_df.columns) > 4:
+    for c, s in zip(master_df.iloc[:, 0].astype(str).str.strip(),
+                    master_df.iloc[:, 4].astype(str)):
+        if c:
+            small_map[c] = s.strip()
 
-# 在庫サマリ
-c1, c2, c3 = st.columns(3)
-c1.metric("FBA", cur_fba)
-c2.metric("自社", cur_jisha)
-c3.metric("販売可能", cur_avail)
+# 在庫行 → 作業用テーブル
+rows = []
+for _, r in inv_df.iterrows():
+    code = str(r[code_col]).strip()
+    if not code:
+        continue
+    rows.append({
+        "小分類": small_map.get(code, ""),
+        "SKU": code,
+        "_G": _f(r.iloc[6]) if len(r) > 6 else 0,    # G 月初在庫
+        "現在庫": _f(r.iloc[5]) if len(r) > 5 else 0,  # F 自社倉庫(計算値)
+    })
+work = pd.DataFrame(rows)
 
-st.markdown("---")
+# 絞り込み
+smalls = sorted([s for s in work["小分類"].unique() if s], reverse=True)
+sel = st.selectbox("小分類で絞り込み", ["（すべて）"] + smalls, key="mob_count_small")
+kw = st.text_input("🔍 SKU検索", "", key="mob_count_kw", placeholder="SKUの一部")
 
-# ===========================================================
-# 月初在庫(G列) 編集
-# ===========================================================
-st.markdown("### 📦 月初在庫 (G列) を更新")
-st.caption("棚卸の実数を入れる。F自社倉庫はGから自動計算")
-st.markdown(f'<div class="big-stock">現在: {cur_month_init}</div>', unsafe_allow_html=True)
+view = work.copy()
+if sel != "（すべて）":
+    view = view[view["小分類"] == sel]
+if kw.strip():
+    view = view[view["SKU"].str.contains(kw, case=False, na=False)]
 
-new_month = st.number_input(
-    "新しい月初在庫",
-    min_value=0, max_value=99999,
-    value=cur_month_init,
-    step=1,
-    key="new_month_init",
+# 小分類 降順 → SKU 昇順
+view = view.sort_values(["小分類", "SKU"], ascending=[False, True]).reset_index(drop=True)
+
+if view.empty:
+    st.warning("該当SKUなし")
+    st.stop()
+
+# 入力初期値=現在庫。実数と違う行だけ直す
+view["実カウント"] = view["現在庫"]
+
+st.caption(f"{len(view)}件　現在庫=自社倉庫。実カウントを実数に直すと、その数になるよう月初在庫(G)を逆算反映します")
+
+edited = st.data_editor(
+    view[["小分類", "SKU", "現在庫", "実カウント"]],
+    use_container_width=True,
+    hide_index=True,
+    height=520,
+    num_rows="fixed",
+    column_config={
+        "小分類": st.column_config.TextColumn(disabled=True, width="small"),
+        "SKU": st.column_config.TextColumn(disabled=True),
+        "現在庫": st.column_config.NumberColumn(disabled=True, format="%d", width="small"),
+        "実カウント": st.column_config.NumberColumn("🟢実カウント", min_value=0, step=1, format="%d"),
+    },
+    key="mob_count_editor",
 )
 
-# ボタン群
-b1, b2, b3 = st.columns(3)
-if b1.button("−1", use_container_width=True, key="mi_minus"):
-    new_month = max(0, new_month - 1)
-    st.session_state["new_month_init"] = new_month
-    st.rerun()
-if b2.button("+1", use_container_width=True, key="mi_plus"):
-    new_month += 1
-    st.session_state["new_month_init"] = new_month
-    st.rerun()
-if b3.button("+10", use_container_width=True, key="mi_plus10"):
-    new_month += 10
-    st.session_state["new_month_init"] = new_month
-    st.rerun()
+# 変更行を抽出して逆算
+emap = dict(zip(edited["SKU"].astype(str), edited["実カウント"]))
+gmap = dict(zip(view["SKU"], view["_G"]))
+fmap = dict(zip(view["SKU"], view["現在庫"]))
+changes = []
+for sku, newc in emap.items():
+    if newc is None or pd.isna(newc):
+        continue
+    newc = int(newc)
+    f_old = int(fmap.get(sku, 0))
+    if newc == f_old:
+        continue
+    g_new = int(gmap.get(sku, 0)) + (newc - f_old)
+    changes.append((sku, newc, g_new))
 
-# 保存ボタン
-if st.button(f"💾 {selected_code} の月初を {new_month} に保存", type="primary", use_container_width=True):
-    if new_month == cur_month_init:
-        st.warning("値が変わってません")
-    else:
-        try:
-            ss = sheets.get_spreadsheet()
-            ws = ss.worksheet("04_在庫管理")
-            # 行番号特定 (1-indexed, ヘッダ行6, データ7〜)
-            codes = ws.col_values(1)
-            target_row = None
-            for i, c in enumerate(codes, start=1):
-                if i >= 7 and c.strip() == selected_code:
-                    target_row = i
-                    break
-            if not target_row:
-                st.error("行が見つからない")
-            else:
-                ws.update(
-                    range_name=f"G{target_row}",
-                    values=[[new_month]],
-                    value_input_option="USER_ENTERED",
-                )
-                sheets._invalidate_one("04_在庫管理")
-                st.success(f"✅ {selected_code} 月初={new_month} に更新")
-                st.balloons()
-        except Exception as e:
-            st.error(f"更新失敗: {e}")
+st.markdown(f"### ✏️ 変更 {len(changes)} 件")
+if changes:
+    st.dataframe(
+        pd.DataFrame(changes, columns=["SKU", "実カウント", "新・月初(G)"]),
+        hide_index=True, use_container_width=True,
+    )
+
+if st.button(f"💾 {len(changes)}件を在庫に反映", type="primary",
+             use_container_width=True, disabled=not changes):
+    try:
+        ss = sheets.get_spreadsheet()
+        ws = ss.worksheet("04_在庫管理")
+        codes = ws.col_values(1)
+        row_of = {}
+        for i, c in enumerate(codes, start=1):
+            if i >= 7 and c.strip():
+                row_of.setdefault(c.strip(), i)
+        reqs, miss = [], []
+        for sku, newc, g_new in changes:
+            row = row_of.get(sku)
+            if not row:
+                miss.append(sku)
+                continue
+            reqs.append({"range": f"G{row}", "values": [[g_new]]})
+        if reqs:
+            sheets.safe_batch_update(ws, reqs, value_input_option="USER_ENTERED")
+            sheets._invalidate_one("04_在庫管理")
+        st.success(
+            f"✅ {len(reqs)}件反映。自社倉庫(F)が実カウントに一致します"
+            + (f" / ⚠未マッチ {len(miss)}件" if miss else "")
+        )
+        st.balloons()
+    except Exception as e:
+        st.error(f"反映失敗: {e}")
 
 st.markdown("---")
-st.caption("📌 F自社倉庫はARRAYFORMULA計算: G月初 + I入荷 - J出荷 - 当月販売")
+st.caption("📌 実カウント=倉庫の実物数。変えた行だけが反映対象です(現在庫と同じ行はスキップ)")
