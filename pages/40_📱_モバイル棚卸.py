@@ -99,6 +99,12 @@ if not master_df.empty and len(master_df.columns) > 5:
 #  - Amazon専売(AMA専売) は自社倉庫に無いので除外
 #  - 小分類なし(マスタ未登録)は終売とみなし除外。ただしマスタ取得失敗時(small_map空)は
 #    全行が小分類なし扱いになり全滅するため、その時は除外しない
+# 自分がこのセッションで反映した値を覚えておく {sku: (F, G)}。
+# F列はARRAYFORMULA(計算値)で、Gを書いた直後の再読込では古い値が返ることがあり、
+# それを基準にすると2回目の反映が「変化なし」とスキップされてしまう。
+# そこで自分の反映済み値があればそれを現在値として使う。
+applied = st.session_state.setdefault("mob_applied", {})
+
 have_small = bool(small_map)
 rows = []
 for _, r in inv_df.iterrows():
@@ -110,11 +116,14 @@ for _, r in inv_df.iterrows():
     small = small_map.get(code, "")
     if have_small and not small:
         continue  # 小分類なし=終売とみなし非表示
+    f_sheet = _f(r.iloc[5]) if len(r) > 5 else 0   # F 自社倉庫(計算値)
+    g_sheet = _f(r.iloc[6]) if len(r) > 6 else 0   # G 月初在庫(直接値)
+    f_cur, g_cur = applied.get(code, (f_sheet, g_sheet))
     rows.append({
         "小分類": small,
         "SKU": code,
-        "_G": _f(r.iloc[6]) if len(r) > 6 else 0,    # G 月初在庫
-        "現在庫": _f(r.iloc[5]) if len(r) > 5 else 0,  # F 自社倉庫(計算値)
+        "_G": g_cur,
+        "現在庫": f_cur,
     })
 work = pd.DataFrame(rows)
 
@@ -220,10 +229,10 @@ if submitted:
                 continue
             f_new = newc
         g_new = int(gmap.get(sku, 0)) + (f_new - f_old)
-        changes.append((sku, newc, g_new))
+        changes.append((sku, f_new, g_new))
 
     if not changes:
-        st.info("入力された変更がありません(空欄か現在庫と同じ値のみ)")
+        st.info("入力された変更がありません(空欄・置換で同値・加算で0のみ)")
     else:
         try:
             ss = sheets.get_spreadsheet()
@@ -234,12 +243,14 @@ if submitted:
                 if i >= 7 and c.strip():
                     row_of.setdefault(c.strip(), i)
             reqs, miss = [], []
-            for sku, newc, g_new in changes:
+            for sku, f_new, g_new in changes:
                 r_idx = row_of.get(sku)
                 if not r_idx:
                     miss.append(sku)
                     continue
                 reqs.append({"range": f"G{r_idx}", "values": [[g_new]]})
+                # 反映済みの値を記憶(F列の計算遅延に左右されず次回比較できるように)
+                applied[sku] = (f_new, g_new)
             if reqs:
                 sheets.safe_batch_update(ws, reqs, value_input_option="USER_ENTERED")
                 sheets._invalidate_one("04_在庫管理")
