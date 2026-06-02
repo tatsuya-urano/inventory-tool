@@ -3,9 +3,19 @@
 
 サイドバーの pages/ から各機能ページに遷移
 """
+import os
+
 import streamlit as st
 
 from lib import sheets, ui
+
+_PAGES_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _plink(path: str, label: str, **kw) -> None:
+    """対象ページが存在する時だけ st.page_link を描画(クラウドで未配置のページを安全にスキップ)。"""
+    if os.path.exists(os.path.join(_PAGES_DIR, path)):
+        st.page_link(path, label=label, **kw)
 
 st.set_page_config(
     page_title="在庫管理ツール",
@@ -34,11 +44,11 @@ if inv.empty:
     st.warning("在庫データを取得できません")
     st.stop()
 
-# ステータス列を探す（14列目想定）
+# ステータス列を探す（X列=index23, 2026-06-02 移設で T→X）
 status_col = None
 candidates = ["ステータス"]
-if len(inv.columns) > 13:
-    candidates.append(inv.columns[13])
+if len(inv.columns) > 23:
+    candidates.append(inv.columns[23])
 for c in candidates:
     if c in inv.columns:
         status_col = c
@@ -60,21 +70,18 @@ st.markdown("---")
 # ===========================================================
 # クイックリンク
 # ===========================================================
-st.markdown("## 🧭 ページ")
-st.markdown(
-    """
-左サイドバーから移動してください:
+st.markdown("## 📱 スマホ用ページ")
+st.caption("スマホはこの3つだけでOK")
+_plink("pages/40_📱_モバイル棚卸.py", "📱 棚卸（在庫を入力）", use_container_width=True)
+_plink("pages/41_📱_モバイル発注チェック.py", "📱 推奨発注数・発注済み", use_container_width=True)
+_plink("pages/44_📱_モバイル到着納品.py", "📱 発注→到着→納品（見るだけ）", use_container_width=True)
 
-- **📋 在庫管理** — 04_在庫管理 の閲覧・絞り込み
-- **💰 売上管理** — 05_売上管理 の閲覧・期間絞り込み
-
-今後追加予定:
-
-- 📈 月次サマリ
-- 🛒 推奨発注リスト
-- 🔧 SKU統合
-"""
-)
+with st.expander("🖥 PC用ページ"):
+    _plink("pages/01_📋_在庫管理.py", "📋 在庫管理")
+    _plink("pages/02_💰_売上管理.py", "💰 売上管理")
+    _plink("pages/05_🛒_推奨発注リスト.py", "🛒 推奨発注リスト")
+    _plink("pages/43_📋_発注到着納品.py", "📋 発注→到着→納品")
+    _plink("pages/07_📈_月次サマリ.py", "📈 月次サマリ")
 
 # ===========================================================
 # 危険SKUのプレビュー

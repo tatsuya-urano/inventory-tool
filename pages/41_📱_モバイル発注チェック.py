@@ -82,9 +82,9 @@ with tab1:
                     return 0
 
             cur_avail = _f(r.iloc[7]) if len(r) > 7 else 0  # H販売可能
-            cur_pending = _f(r.iloc[11]) if len(r) > 11 else 0  # L発注済
-            cur_rec = _f(r.iloc[12]) if len(r) > 12 else 0  # M推奨発注
-            status = str(r.iloc[19]) if len(r) > 19 else ""
+            cur_pending = _f(r.iloc[11]) if len(r) > 11 else 0  # L発注済(手動)
+            cur_rec = _f(r.iloc[16]) if len(r) > 16 else 0  # Q推奨発注 (2026-06-02 移設 M→Q)
+            status = str(r.iloc[23]) if len(r) > 23 else ""  # Xステータス (2026-06-02 移設 T→X)
 
             st.markdown(f"""
             <div class="sku-card">
@@ -156,10 +156,10 @@ with tab2:
 
     code_col = inv_df.columns[0]
     title_col = inv_df.columns[1] if len(inv_df.columns) > 1 else None
-    if len(inv_df.columns) <= 19:
+    if len(inv_df.columns) <= 23:
         st.warning("ステータス列なし")
         st.stop()
-    status_col = inv_df.columns[19]
+    status_col = inv_df.columns[23]  # X列 ステータス (2026-06-02 移設 T→X)
 
     danger = inv_df[inv_df[status_col].isin(["🔴危険", "🟠要発注", "⚪在庫なし"])].copy()
     if danger.empty:
@@ -174,8 +174,8 @@ with tab2:
         # 発注済列も
         if len(inv_df.columns) > 11:
             show_cols.append(inv_df.columns[11])
-        if len(inv_df.columns) > 12:
-            show_cols.append(inv_df.columns[12])
+        if len(inv_df.columns) > 16:
+            show_cols.append(inv_df.columns[16])  # Q列 推奨発注数 (2026-06-02 移設 M→Q)
 
         st.dataframe(
             danger[show_cols].rename(columns={
@@ -183,7 +183,7 @@ with tab2:
                 title_col: "タイトル" if title_col else "",
                 status_col: "状態",
                 inv_df.columns[11]: "発注済" if len(inv_df.columns) > 11 else "",
-                inv_df.columns[12]: "推奨" if len(inv_df.columns) > 12 else "",
+                inv_df.columns[16]: "推奨" if len(inv_df.columns) > 16 else "",
             }),
             use_container_width=True,
             hide_index=True,
