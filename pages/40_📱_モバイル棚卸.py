@@ -115,22 +115,32 @@ if view.empty:
 # data_editorはスマホで数値が累積・消せない不具合があるため、st.formの
 # 行ごとnumber_inputに変更。formは送信ボタンを押すまで再実行しないので、
 # 入力途中で数字が勝手に足される/消せない問題が起きない。
-MAX_ROWS = 120
-if len(view) > MAX_ROWS:
-    st.warning(
-        f"{len(view)}件は一度に表示するには多すぎます。"
-        "上の「小分類で絞り込み」かSKU検索で絞ってください。"
+# 件数が多いと重いので200件ずつページ送り。ページ内で入力→反映を繰り返す。
+PAGE_SIZE = 200
+total = len(view)
+n_pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
+if n_pages > 1:
+    page = st.selectbox(
+        "ページ (200件ずつ)",
+        list(range(1, n_pages + 1)),
+        format_func=lambda p: f"{p}/{n_pages}ページ "
+                              f"({(p-1)*PAGE_SIZE+1}〜{min(p*PAGE_SIZE, total)}件)",
+        key="mob_count_page",
     )
-    st.stop()
+else:
+    page = 1
+start = (page - 1) * PAGE_SIZE
+view_page = view.iloc[start:start + PAGE_SIZE].reset_index(drop=True)
 
-st.caption(f"{len(view)}件　各SKUに実数を入力 → 「反映」を押した時だけ保存。"
-           "空欄の行はスキップ(現在庫のまま)。途中で押しても累積しません")
+st.caption(f"全{total}件中 {start+1}〜{min(start+PAGE_SIZE, total)}件目を表示　"
+           "各SKUに実数を入力 → 「反映」を押した時だけ保存。"
+           "空欄の行はスキップ(現在庫のまま)。ページを変える前に反映を押してください")
 
-gmap = dict(zip(view["SKU"], view["_G"]))
-fmap = dict(zip(view["SKU"], view["現在庫"]))
+gmap = dict(zip(view_page["SKU"], view_page["_G"]))
+fmap = dict(zip(view_page["SKU"], view_page["現在庫"]))
 
 with st.form("mob_count_form", clear_on_submit=False):
-    for _, row in view.iterrows():
+    for _, row in view_page.iterrows():
         sku = row["SKU"]
         f_old = int(row["現在庫"])
         small = row["小分類"] or "（小分類なし）"
@@ -145,7 +155,7 @@ with st.form("mob_count_form", clear_on_submit=False):
 if submitted:
     # 入力値を集計して逆算 (空欄=None はスキップ、現在庫と同じ値もスキップ)
     changes = []
-    for sku in view["SKU"]:
+    for sku in view_page["SKU"]:
         newc = st.session_state.get(f"mob_cnt_{sku}")
         if newc is None:
             continue
