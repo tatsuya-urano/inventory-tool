@@ -26,6 +26,22 @@ st.markdown("""
         font-size: 18px !important;
         height: 46px !important;
     }
+    /* 反映(送信)ボタンを画面右下に常駐させる。入力後すぐ押せるように */
+    div[data-testid="stFormSubmitButton"] {
+        position: fixed;
+        bottom: 16px;
+        right: 16px;
+        z-index: 9999;
+        width: auto !important;
+    }
+    div[data-testid="stFormSubmitButton"] button {
+        height: 52px !important;
+        font-size: 17px !important;
+        font-weight: 700 !important;
+        border-radius: 28px !important;
+        padding: 0 22px !important;
+        box-shadow: 0 4px 14px rgba(0,0,0,0.35);
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -95,7 +111,7 @@ for _, r in inv_df.iterrows():
 work = pd.DataFrame(rows)
 
 # 絞り込み
-smalls = sorted([s for s in work["小分類"].unique() if s], reverse=True)
+smalls = sorted([s for s in work["小分類"].unique() if s])
 sel = st.selectbox("小分類で絞り込み", ["（すべて）"] + smalls, key="mob_count_small")
 kw = st.text_input("🔍 SKU検索", "", key="mob_count_kw", placeholder="SKUの一部")
 
@@ -105,8 +121,8 @@ if sel != "（すべて）":
 if kw.strip():
     view = view[view["SKU"].str.contains(kw, case=False, na=False)]
 
-# 小分類 降順 → SKU 昇順
-view = view.sort_values(["小分類", "SKU"], ascending=[False, True]).reset_index(drop=True)
+# 小分類 昇順 → SKU 昇順(上る順)
+view = view.sort_values(["小分類", "SKU"], ascending=[True, True]).reset_index(drop=True)
 
 if view.empty:
     st.warning("該当SKUなし")
@@ -150,7 +166,7 @@ with st.form("mob_count_form", clear_on_submit=False):
             key=f"mob_cnt_{sku}",
         )
     submitted = st.form_submit_button(
-        "💾 入力した行を在庫に反映", type="primary", use_container_width=True)
+        "💾 反映", type="primary", use_container_width=False)
 
 if submitted:
     # 入力値を集計して逆算 (空欄=None はスキップ、現在庫と同じ値もスキップ)
@@ -194,6 +210,23 @@ if submitted:
             st.balloons()
         except Exception as e:
             st.error(f"反映失敗: {e}")
+
+# 下部のページ遷移(スクロールし切った場所からでも移動できるように)
+if n_pages > 1:
+    st.markdown("---")
+    st.caption(f"ページ {page}/{n_pages}　※移動前に「反映」を押してください(未反映の入力は消えます)")
+    pcol1, pcol2, pcol3 = st.columns([1, 1, 1])
+    if pcol1.button("◀ 前へ", use_container_width=True,
+                    disabled=page <= 1, key="mob_count_prev"):
+        st.session_state["mob_count_page"] = page - 1
+        st.rerun()
+    pcol2.markdown(
+        f"<div style='text-align:center;line-height:52px;font-weight:700;'>"
+        f"{page} / {n_pages}</div>", unsafe_allow_html=True)
+    if pcol3.button("次へ ▶", use_container_width=True,
+                    disabled=page >= n_pages, key="mob_count_next"):
+        st.session_state["mob_count_page"] = page + 1
+        st.rerun()
 
 st.markdown("---")
 st.caption("📌 実カウント=倉庫の実物数。入力した行だけが反映対象(空欄・現在庫と同じ値はスキップ)。Amazon専売(AMA専売)は自社倉庫に無いので非表示")
