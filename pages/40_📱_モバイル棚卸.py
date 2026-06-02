@@ -94,7 +94,11 @@ if not master_df.empty and len(master_df.columns) > 5:
         if c:
             channel_map[c] = ch.strip()
 
-# 在庫行 → 作業用テーブル (Amazon専売=AMA専売 は自社倉庫に無いので除外)
+# 在庫行 → 作業用テーブル
+#  - Amazon専売(AMA専売) は自社倉庫に無いので除外
+#  - 小分類なし(マスタ未登録)は終売とみなし除外。ただしマスタ取得失敗時(small_map空)は
+#    全行が小分類なし扱いになり全滅するため、その時は除外しない
+have_small = bool(small_map)
 rows = []
 for _, r in inv_df.iterrows():
     code = str(r[code_col]).strip()
@@ -102,8 +106,11 @@ for _, r in inv_df.iterrows():
         continue
     if channel_map.get(code) == "AMA専売":
         continue
+    small = small_map.get(code, "")
+    if have_small and not small:
+        continue  # 小分類なし=終売とみなし非表示
     rows.append({
-        "小分類": small_map.get(code, ""),
+        "小分類": small,
         "SKU": code,
         "_G": _f(r.iloc[6]) if len(r) > 6 else 0,    # G 月初在庫
         "現在庫": _f(r.iloc[5]) if len(r) > 5 else 0,  # F 自社倉庫(計算値)
