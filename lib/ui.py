@@ -114,7 +114,7 @@ def render_top_nav() -> None:
                 f'<a class="nav-sub-item" href="{href}" target="_self">{page_label}</a>'
             )
         items_html += (
-            f'<div class="nav-group">'
+            f'<div class="nav-group" tabindex="0">'
             f'  <div class="nav-group-label">{label} <span class="nav-arrow">▾</span></div>'
             f'  <div class="nav-dropdown">{sub_html}</div>'
             f'</div>'
@@ -178,6 +178,7 @@ def render_top_nav() -> None:
         }}
         .nav-group {{
             position: relative;
+            outline: none;
         }}
         .nav-group-label {{
             padding: 9px 16px;
@@ -193,7 +194,8 @@ def render_top_nav() -> None:
             white-space: nowrap;
             text-shadow: 0 1px 2px rgba(0, 0, 0, 0.15);
         }}
-        .nav-group:hover .nav-group-label {{
+        .nav-group:hover .nav-group-label,
+        .nav-group:focus-within .nav-group-label {{
             background: rgba(255, 255, 255, 0.18);
             transform: translateY(-1px);
         }}
@@ -202,7 +204,8 @@ def render_top_nav() -> None:
             opacity: 0.85;
             transition: transform 0.15s ease;
         }}
-        .nav-group:hover .nav-arrow {{
+        .nav-group:hover .nav-arrow,
+        .nav-group:focus-within .nav-arrow {{
             transform: rotate(180deg);
         }}
         .nav-dropdown {{
@@ -220,7 +223,8 @@ def render_top_nav() -> None:
             transform: translateY(-4px);
             transition: opacity 0.15s ease, transform 0.15s ease, visibility 0.15s;
         }}
-        .nav-group:hover .nav-dropdown {{
+        .nav-group:hover .nav-dropdown,
+        .nav-group:focus-within .nav-dropdown {{
             opacity: 1;
             visibility: visible;
             transform: translateY(0);
