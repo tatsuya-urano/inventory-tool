@@ -64,19 +64,27 @@ def _f(v):
         return 0
 
 
-# 商品コード → 小分類 (マスタ E列=index4)
+# 商品コード → 小分類 (マスタ E列=index4) / 販売チャネル (マスタ F列=index5)
 small_map = {}
+channel_map = {}
 if not master_df.empty and len(master_df.columns) > 4:
     for c, s in zip(master_df.iloc[:, 0].astype(str).str.strip(),
                     master_df.iloc[:, 4].astype(str)):
         if c:
             small_map[c] = s.strip()
+if not master_df.empty and len(master_df.columns) > 5:
+    for c, ch in zip(master_df.iloc[:, 0].astype(str).str.strip(),
+                     master_df.iloc[:, 5].astype(str)):
+        if c:
+            channel_map[c] = ch.strip()
 
-# 在庫行 → 作業用テーブル
+# 在庫行 → 作業用テーブル (Amazon専売=AMA専売 は自社倉庫に無いので除外)
 rows = []
 for _, r in inv_df.iterrows():
     code = str(r[code_col]).strip()
     if not code:
+        continue
+    if channel_map.get(code) == "AMA専売":
         continue
     rows.append({
         "小分類": small_map.get(code, ""),
@@ -177,4 +185,4 @@ if st.button(f"💾 {len(changes)}件を在庫に反映", type="primary",
         st.error(f"反映失敗: {e}")
 
 st.markdown("---")
-st.caption("📌 実カウント=倉庫の実物数。変えた行だけが反映対象です(現在庫と同じ行はスキップ)")
+st.caption("📌 実カウント=倉庫の実物数。変えた行だけが反映対象です(現在庫と同じ行はスキップ)。Amazon専売(AMA専売)は自社倉庫に無いので非表示")
