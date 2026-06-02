@@ -155,9 +155,25 @@ else:
 start = (page - 1) * PAGE_SIZE
 view_page = view.iloc[start:start + PAGE_SIZE].reset_index(drop=True)
 
-st.caption(f"全{total}件中 {start+1}〜{min(start+PAGE_SIZE, total)}件目を表示　"
-           "各SKUに実数を入力 → 「反映」を押した時だけ保存。"
-           "空欄の行はスキップ(現在庫のまま)。ページを変える前に反映を押してください")
+# 入力方法。棚→バッファのように2回に分けて数える時は「加算」を使う
+mode = st.radio(
+    "入力方法",
+    ["置き換え（数えた実数）", "加算（今の在庫に足す）"],
+    horizontal=True,
+    key="mob_count_mode",
+    help="棚を先に数えて反映 → 次にバッファを数える時は『加算』にすると、"
+         "入力した数が今の在庫に足されます",
+)
+add_mode = mode.startswith("加算")
+
+if add_mode:
+    st.caption(f"全{total}件中 {start+1}〜{min(start+PAGE_SIZE, total)}件目　"
+               "🟢加算モード：入力した数を今の在庫に足します(空欄・0はスキップ)。"
+               "ページを変える前に反映を押してください")
+else:
+    st.caption(f"全{total}件中 {start+1}〜{min(start+PAGE_SIZE, total)}件目　"
+               "置き換えモード：入力した実数に在庫を合わせます(空欄はスキップ)。"
+               "ページを変える前に反映を押してください")
 
 gmap = dict(zip(view_page["SKU"], view_page["_G"]))
 fmap = dict(zip(view_page["SKU"], view_page["現在庫"]))
@@ -167,8 +183,10 @@ with st.form("mob_count_form", clear_on_submit=False):
         sku = row["SKU"]
         f_old = int(row["現在庫"])
         small = row["小分類"] or "（小分類なし）"
+        label = (f"{small}　|　{sku}　(現在 {f_old}) ＋足す数"
+                 if add_mode else f"{small}　|　{sku}　(現在 {f_old})")
         st.number_input(
-            f"{small}　|　{sku}　(現在 {f_old})",
+            label,
             min_value=0, step=1, value=None,
             key=f"mob_cnt_{sku}",
         )
@@ -176,7 +194,10 @@ with st.form("mob_count_form", clear_on_submit=False):
         "💾 反映", type="primary", use_container_width=False)
 
 if submitted:
-    # 入力値を集計して逆算 (空欄=None はスキップ、現在庫と同じ値もスキップ)
+    # 入力値を集計して逆算
+    #  置き換え: newc=目標実数 → F_new=newc  (空欄/現在庫と同値はスキップ)
+    #  加算    : newc=足す数  → F_new=f_old+newc (空欄/0はスキップ)
+    # どちらも G_new = G_old + (F_new - F_old)
     changes = []
     for sku in view_page["SKU"]:
         newc = st.session_state.get(f"mob_cnt_{sku}")
@@ -184,9 +205,15 @@ if submitted:
             continue
         newc = int(newc)
         f_old = int(fmap.get(sku, 0))
-        if newc == f_old:
-            continue
-        g_new = int(gmap.get(sku, 0)) + (newc - f_old)
+        if add_mode:
+            if newc == 0:
+                continue
+            f_new = f_old + newc
+        else:
+            if newc == f_old:
+                continue
+            f_new = newc
+        g_new = int(gmap.get(sku, 0)) + (f_new - f_old)
         changes.append((sku, newc, g_new))
 
     if not changes:
