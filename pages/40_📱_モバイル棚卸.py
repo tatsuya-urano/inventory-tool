@@ -26,11 +26,12 @@ st.markdown("""
         font-size: 18px !important;
         height: 46px !important;
     }
-    /* 反映(送信)ボタンを画面右下に常駐させる。入力後すぐ押せるように */
+    /* 反映(送信)ボタンを画面左下に常駐させる。
+       右下はStreamlit CloudのManage appボタンと重なるため左下に配置 */
     div[data-testid="stFormSubmitButton"] {
         position: fixed;
-        bottom: 16px;
-        right: 16px;
+        bottom: 24px;
+        left: 16px;
         z-index: 9999;
         width: auto !important;
     }
