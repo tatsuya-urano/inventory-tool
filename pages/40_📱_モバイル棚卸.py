@@ -179,7 +179,9 @@ else:
 gmap = dict(zip(view_page["SKU"], view_page["_G"]))
 fmap = dict(zip(view_page["SKU"], view_page["現在庫"]))
 
-with st.form("mob_count_form", clear_on_submit=False):
+# clear_on_submit=True: 反映するたびに入力欄を空にする。
+# (Falseだと前回の数字が残り、もう一度押すと再適用=加算モードで二重に足される)
+with st.form("mob_count_form", clear_on_submit=True):
     for _, row in view_page.iterrows():
         sku = row["SKU"]
         f_old = int(row["現在庫"])
