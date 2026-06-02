@@ -190,8 +190,9 @@ fmap = dict(zip(view_page["SKU"], view_page["現在庫"]))
 
 # clear_on_submit=True: 反映するたびに入力欄を空にする。
 # (Falseだと前回の数字が残り、もう一度押すと再適用=加算モードで二重に足される)
-# 値は number_input の戻り値を inputs に集める。clear_on_submit時は
-# st.session_state が送信時点で既にクリアされ読めないため、戻り値を使う。
+# ※clear_on_submit時は number_input に key を付けてはいけない。
+#   key付きだと送信時に session_state クリアと戻り値取得が競合し、
+#   再入力した値が None 扱いになって反映されない。戻り値だけで受け取る。
 inputs = {}
 with st.form("mob_count_form", clear_on_submit=True):
     for _, row in view_page.iterrows():
@@ -203,7 +204,6 @@ with st.form("mob_count_form", clear_on_submit=True):
         inputs[sku] = st.number_input(
             label,
             min_value=0, step=1, value=None,
-            key=f"mob_cnt_{sku}",
         )
     submitted = st.form_submit_button(
         "💾 反映", type="primary", use_container_width=False)
