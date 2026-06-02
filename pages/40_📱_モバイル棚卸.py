@@ -123,10 +123,11 @@ edited = st.data_editor(
     hide_index=True,
     height=520,
     num_rows="fixed",
-    # SKU・現在庫は非表示(保存の照合/逆算用に内部データとしては保持)。小分類を大きく
+    # SKU・現在庫は非表示(保存の照合/逆算用に内部データとしては保持)
+    # 2列だけ&width小で、横スクロールなしに一画面へ収める
     column_order=("小分類", "実カウント"),
     column_config={
-        "小分類": st.column_config.TextColumn(disabled=True, width="large"),
+        "小分類": st.column_config.TextColumn(disabled=True, width="small"),
         "SKU": st.column_config.TextColumn(disabled=True),
         "現在庫": st.column_config.NumberColumn("現在庫", disabled=True, format="%d", width="small"),
         "実カウント": st.column_config.NumberColumn("🟢実カウント", min_value=0, step=1, format="%d", width="small"),
