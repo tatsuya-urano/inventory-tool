@@ -6,6 +6,8 @@
   O FBA発送済み        = FBA納品
   P 自社発送済み        = 自社納品
 """
+import unicodedata
+
 import streamlit as st
 import pandas as pd
 
@@ -59,6 +61,12 @@ def _f(v):
         return 0
 
 
+def _norm(s):
+    """検索用の正規化。NFKCで全角英数字/カナを半角相当に統一し、小文字化。
+    これで半角/全角を気にせず検索できる。"""
+    return unicodedata.normalize("NFKC", str(s)).lower().strip()
+
+
 # 04列(2026-06-02移設): M仕入中=12 / Nラクマート到着=13 / O FBA発送=14 / P自社発送=15
 def _row_status(r):
     return (
@@ -73,13 +81,14 @@ tab1, tab2 = st.tabs(["🔍 個別検索", "📋 発注中一覧"])
 
 with tab1:
     search = st.text_input("🔍 SKU or タイトル検索", key="mob_ad_search",
-                           placeholder="SKUの一部")
-    if not search.strip():
+                           placeholder="SKUの一部（半角/全角どちらでもOK）")
+    q = _norm(search)
+    if not q:
         st.info("SKU or タイトルの一部を入力")
     else:
-        mask = inv_df[code_col].astype(str).str.contains(search, case=False, na=False)
+        mask = inv_df[code_col].astype(str).map(_norm).str.contains(q, na=False, regex=False)
         if title_col:
-            mask |= inv_df[title_col].astype(str).str.contains(search, case=False, na=False)
+            mask |= inv_df[title_col].astype(str).map(_norm).str.contains(q, na=False, regex=False)
         hits = inv_df[mask].head(10)
         if hits.empty:
             st.warning("マッチなし")
@@ -102,21 +111,31 @@ with tab1:
 
 with tab2:
     st.caption("M仕入中・N到着・O FBA発送・P自社発送 のいずれかが>0のSKU")
+    kw = st.text_input("🔍 SKU or タイトルで絞り込み", key="mob_ad_list_kw",
+                       placeholder="SKUの一部（半角/全角どちらでもOK・空欄で全件）")
+    qk = _norm(kw)
     rows = []
     for _, r in inv_df.iterrows():
         m, n, o, p = _row_status(r)
         if (m + n + o + p) <= 0:
             continue
+        code = str(r[code_col]).strip()
+        title = str(r[title_col]).strip()[:30] if title_col else ""
+        if qk and qk not in _norm(code) and qk not in _norm(title):
+            continue
         rows.append({
-            "SKU": str(r[code_col]).strip(),
-            "タイトル": str(r[title_col]).strip()[:30] if title_col else "",
+            "SKU": code,
+            "タイトル": title,
             "⏳仕入中": m,
             "✅到着": n,
             "📦FBA発送": o,
             "🏠自社発送": p,
         })
     if not rows:
-        st.success("✨ Rakumart発注中の在庫なし")
+        if qk:
+            st.warning("該当SKUなし（絞り込み条件にマッチしません）")
+        else:
+            st.success("✨ Rakumart発注中の在庫なし")
     else:
         out = pd.DataFrame(rows).sort_values(
             ["✅到着", "⏳仕入中"], ascending=False)
