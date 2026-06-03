@@ -127,14 +127,15 @@ for _, r in inv_df.iterrows():
     })
 work = pd.DataFrame(rows)
 
-# 絞り込み
-smalls = sorted([s for s in work["小分類"].unique() if s])
-sel = st.selectbox("小分類で絞り込み", ["（すべて）"] + smalls, key="mob_count_small")
-kw = st.text_input("🔍 SKU検索", "", key="mob_count_kw", placeholder="SKUの一部")
+# 絞り込み（小分類・SKUとも文字入力で検索）
+sc1, sc2 = st.columns(2)
+small_kw = sc1.text_input("🔍 小分類検索", "", key="mob_count_small_kw",
+                          placeholder="小分類の一部")
+kw = sc2.text_input("🔍 SKU検索", "", key="mob_count_kw", placeholder="SKUの一部")
 
 view = work.copy()
-if sel != "（すべて）":
-    view = view[view["小分類"] == sel]
+if small_kw.strip():
+    view = view[view["小分類"].str.contains(small_kw, case=False, na=False)]
 if kw.strip():
     view = view[view["SKU"].str.contains(kw, case=False, na=False)]
 
