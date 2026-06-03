@@ -67,8 +67,11 @@ with st.expander("💰 在庫金額サマリ", expanded=True):
                 k_val = _to_num(r.iloc[10]) if len(r) > 10 else 0
                 if k_val > 0:
                     sell_amount += k_val
-                # 発注済み(L列, インデックス11) × マスタ原価
-                ordered_qty = _to_num(r.iloc[11]) if len(r) > 11 else 0
+                # 発注中(空中在庫) = Rakumart M〜P列合算(インデックス12-15) × マスタ原価
+                #   M仕入中 / Nラクマート到着 / O FBA発送 / P自社発送 (2026-06-02 L手動発注済みから移行)
+                ordered_qty = sum(
+                    _to_num(r.iloc[ci]) for ci in (12, 13, 14, 15) if len(r) > ci
+                )
                 if ordered_qty > 0:
                     order_amount += ordered_qty * master_cost.get(code, 0)
 
@@ -588,16 +591,20 @@ with tab4:
             m_h = m_cols[7] if len(m_cols) > 7 else None       # 原価
             m_i = m_cols[8] if len(m_cols) > 8 else None       # 手数料(率 or 実数)
             m_j = m_cols[9] if len(m_cols) > 9 else None       # 送料
+            m_f  = m_cols[5] if len(m_cols) > 5 else None      # 販売チャネル
             m_ae = m_cols[30] if len(m_cols) > 30 else None    # 楽天SKU
             m_af = m_cols[31] if len(m_cols) > 31 else None    # Amazon FBM SKU
             m_ag = m_cols[32] if len(m_cols) > 32 else None    # Amazon FBA SKU
+            m_al = m_cols[37] if len(m_cols) > 37 else None    # 楽天送料(楽天専用)
 
-            # ルックアップ辞書: 任意のSKU文字列 → (cost, fee, ship)
-            lookup: dict[str, tuple[float, float, float]] = {}
+            # ルックアップ辞書: 任意のSKU文字列 → (cost, fee, ship_j, ship_rk, 商品チャネル)
+            lookup: dict[str, tuple[float, float, float, float, str]] = {}
             for _, mr in master.iterrows():
                 tup = (_f(mr[m_h]) if m_h else 0,
                        _fee(mr[m_i]) if m_i else 0,
-                       _f(mr[m_j]) if m_j else 0)
+                       _f(mr[m_j]) if m_j else 0,
+                       _f(mr[m_al]) if m_al else 0,
+                       str(mr[m_f]).strip() if m_f else "")
                 for kc in [m_a, m_ae, m_af, m_ag]:
                     if kc is None:
                         continue
@@ -637,12 +644,25 @@ with tab4:
                         if code not in miss_codes:
                             miss_codes.append(code)
                         continue
-                    cost_unit, fee_unit, ship_unit = m
+                    cost_unit, fee_unit, ship_unit, ship_rk_unit, prod_ch = m
                     qty = _f(row[COL_QTY]) if COL_QTY else 1
                     amount = _f(row[COL_AMOUNT]) if COL_AMOUNT else 0
+                    channel = str(row[COL_CHANNEL]).strip() if COL_CHANNEL else ""
                     cost = round(cost_unit * qty, 2)
-                    fee = round(amount * fee_unit if fee_unit < 1 else fee_unit * qty, 2)
-                    ship = round(ship_unit * qty, 2) if ship_unit else 0
+                    # 楽天行=手数料10%固定。送料は商品チャネルで分岐:
+                    #  ・両方(併売)商品 → AL列(楽天送料)。J列はAmazon FBA送料なので使わない
+                    #  ・楽天専売商品   → J列(手動の楽天送料)。ALがあればAL優先
+                    # Amazon行はマスタI列(手数料)/J列(送料=Amazon FBA送料)。
+                    if channel == "楽天":
+                        fee = round(amount * 0.10, 2)
+                        if prod_ch == "両方":
+                            ship = round(ship_rk_unit * qty, 2) if ship_rk_unit else 0
+                        else:
+                            rk = ship_rk_unit if ship_rk_unit else ship_unit
+                            ship = round(rk * qty, 2) if rk else 0
+                    else:
+                        fee = round(amount * fee_unit if fee_unit < 1 else fee_unit * qty, 2)
+                        ship = round(ship_unit * qty, 2) if ship_unit else 0
                     point = _f(row[COL_POINT]) if COL_POINT else 0
                     coupon = _f(row[COL_COUPON]) if COL_COUPON else 0
                     profit = round(amount - cost - fee - ship - point - coupon, 2)
