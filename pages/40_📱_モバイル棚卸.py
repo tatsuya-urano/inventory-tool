@@ -49,22 +49,39 @@ st.markdown("""
 st.title("📱 モバイル棚卸")
 st.caption("小分類順に実在庫を入力 → 自社倉庫に反映")
 
+def _f(v):
+    try:
+        return int(float(str(v).replace(",", "").replace("¥", "").strip() or 0))
+    except (ValueError, TypeError):
+        return 0
+
+
+# 04_在庫管理はTODAY()依存の重い数式で読込に8分半かかる。表示用は家PCバッチが焼く
+# 数式ゼロの軽量スナップ(0.4秒)を読む(小分類/販売チャネルもスナップ列に同梱)。
+# スナップ未生成時のみ、重い04直読み+マスタにフォールバック。
 with st.spinner("読込中..."):
     try:
-        inv_df = sheets.load_inventory()
-    except Exception as e:
-        st.error("📡 在庫データの取得に失敗しました（サーバー混雑かも）。")
-        st.caption(f"詳細: {type(e).__name__}")
-        if st.button("🔄 もう一度読み込む"):
-            sheets._invalidate_one("04_在庫管理")
-            st.rerun()
-        st.stop()
-    # マスタは小分類の取得だけに使う補助データ。失敗しても棚卸は続行
-    try:
-        master_df = sheets.load_master()
+        inv_df = sheets.load_inventory_snapshot()
     except Exception:
-        master_df = pd.DataFrame()
-        st.warning("⚠ 小分類を取得できませんでした（サーバー混雑）。並びは小分類なしになります。")
+        inv_df = pd.DataFrame()
+    from_snapshot = not inv_df.empty
+    if not from_snapshot:
+        st.info("⏳ 在庫スナップ未生成のため04を直読みします（数分かかることがあります）")
+        try:
+            inv_df = sheets.load_inventory()
+        except Exception as e:
+            st.error("📡 在庫データの取得に失敗しました（サーバー混雑かも）。")
+            st.caption(f"詳細: {type(e).__name__}")
+            if st.button("🔄 もう一度読み込む"):
+                sheets._invalidate_one("04_在庫管理")
+                st.rerun()
+            st.stop()
+        # フォールバック時のみ小分類/チャネルをマスタから補う
+        try:
+            master_df = sheets.load_master()
+        except Exception:
+            master_df = pd.DataFrame()
+            st.warning("⚠ 小分類を取得できませんでした（サーバー混雑）。並びは小分類なしになります。")
 
 if inv_df.empty:
     st.error("在庫データ読込失敗")
@@ -73,31 +90,24 @@ if inv_df.empty:
 code_col = inv_df.columns[0]
 title_col = inv_df.columns[1] if len(inv_df.columns) > 1 else code_col
 
-
-def _f(v):
-    try:
-        return int(float(str(v).replace(",", "").replace("¥", "").strip() or 0))
-    except (ValueError, TypeError):
-        return 0
-
-
-# 商品コード → 小分類 (マスタ E列=index4) / 販売チャネル (マスタ F列=index5)
+# フォールバック(重い04直読)時: 商品コード→小分類(マスタE=idx4)/販売チャネル(F=idx5)
 small_map = {}
 channel_map = {}
-if not master_df.empty and len(master_df.columns) > 4:
-    for c, s in zip(master_df.iloc[:, 0].astype(str).str.strip(),
-                    master_df.iloc[:, 4].astype(str)):
-        if c:
-            small_map[c] = s.strip()
-if not master_df.empty and len(master_df.columns) > 5:
-    for c, ch in zip(master_df.iloc[:, 0].astype(str).str.strip(),
-                     master_df.iloc[:, 5].astype(str)):
-        if c:
-            channel_map[c] = ch.strip()
+if not from_snapshot:
+    if not master_df.empty and len(master_df.columns) > 4:
+        for c, s in zip(master_df.iloc[:, 0].astype(str).str.strip(),
+                        master_df.iloc[:, 4].astype(str)):
+            if c:
+                small_map[c] = s.strip()
+    if not master_df.empty and len(master_df.columns) > 5:
+        for c, ch in zip(master_df.iloc[:, 0].astype(str).str.strip(),
+                         master_df.iloc[:, 5].astype(str)):
+            if c:
+                channel_map[c] = ch.strip()
 
 # 在庫行 → 作業用テーブル
 #  - Amazon専売(AMA専売) は自社倉庫に無いので除外
-#  - 小分類なし(マスタ未登録)は終売とみなし除外。ただしマスタ取得失敗時(small_map空)は
+#  - 小分類なし(マスタ未登録)は終売とみなし除外。ただし小分類が全く取れない時は
 #    全行が小分類なし扱いになり全滅するため、その時は除外しない
 # 自分がこのセッションで反映した値を覚えておく {sku: (F, G)}。
 # F列はARRAYFORMULA(計算値)で、Gを書いた直後の再読込では古い値が返ることがあり、
@@ -105,19 +115,31 @@ if not master_df.empty and len(master_df.columns) > 5:
 # そこで自分の反映済み値があればそれを現在値として使う。
 applied = st.session_state.setdefault("mob_applied", {})
 
-have_small = bool(small_map)
+if from_snapshot:
+    have_small = ("小分類" in inv_df.columns
+                  and inv_df["小分類"].astype(str).str.strip().ne("").any())
+else:
+    have_small = bool(small_map)
+
 rows = []
 for _, r in inv_df.iterrows():
     code = str(r[code_col]).strip()
     if not code:
         continue
-    if channel_map.get(code) == "AMA専売":
+    if from_snapshot:
+        channel = str(r.get("販売チャネル", "")).strip()
+        small = str(r.get("小分類", "")).strip()
+        f_sheet = _f(r.get("自社倉庫", 0))   # 自社倉庫(スナップ焼付値)
+        g_sheet = _f(r.get("月初在庫", 0))   # 月初在庫(スナップ焼付値)
+    else:
+        channel = channel_map.get(code, "")
+        small = small_map.get(code, "")
+        f_sheet = _f(r.iloc[5]) if len(r) > 5 else 0   # F 自社倉庫(計算値)
+        g_sheet = _f(r.iloc[6]) if len(r) > 6 else 0   # G 月初在庫(直接値)
+    if channel == "AMA専売":
         continue
-    small = small_map.get(code, "")
     if have_small and not small:
         continue  # 小分類なし=終売とみなし非表示
-    f_sheet = _f(r.iloc[5]) if len(r) > 5 else 0   # F 自社倉庫(計算値)
-    g_sheet = _f(r.iloc[6]) if len(r) > 6 else 0   # G 月初在庫(直接値)
     f_cur, g_cur = applied.get(code, (f_sheet, g_sheet))
     rows.append({
         "小分類": small,

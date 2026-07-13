@@ -11,6 +11,9 @@ SERVICE_ACCOUNT_JSON = (
 
 # シート名（GAS の SHEETS と揃える）
 SHEET_INVENTORY     = "04_在庫管理"
+# 04_在庫管理は TODAY()依存の重い数式で読込に8分半かかる。表示用は家PCバッチが
+# 数式ゼロで焼き付けた軽量スナップ(0.4秒)を読む。書込は本物の04へ。
+SHEET_INV_SNAPSHOT  = "04_在庫スナップ"
 SHEET_SALES         = "05_売上管理"
 SHEET_SUMMARY       = "15_サマリ"
 SHEET_PRODUCT_MASTER = "03_商品マスタ参照"

@@ -206,6 +206,21 @@ def load_inventory() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=config.CACHE_TTL_SECONDS)
+def load_inventory_snapshot() -> pd.DataFrame:
+    """04_在庫スナップ(家PCバッチが焼く数式ゼロの軽量スナップ)を読む。
+
+    04_在庫管理はTODAY()依存の重い数式で読込に8分半かかるため、表示用はこの
+    スナップ(0.4秒)を使う。列: 商品コード/タイトル/自社倉庫/月初在庫/ステータス/
+    在庫日数/推奨発注数/小分類/販売チャネル。ヘッダ行1・データ2行目〜。
+    スナップ未生成(バッチ未実行)なら空DataFrameを返す→呼び出し側でフォールバック。
+    """
+    values = _fetch_raw(config.SHEET_INV_SNAPSHOT)
+    if not values:
+        return pd.DataFrame()
+    return _values_to_df(values, 1, 2)
+
+
+@st.cache_data(ttl=config.CACHE_TTL_SECONDS)
 def load_sales(include_archive: bool = False) -> pd.DataFrame:
     """05_売上管理 を読込
 

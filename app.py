@@ -37,17 +37,20 @@ ui.sidebar_common()
 # ===========================================================
 st.markdown("## 📊 ダッシュボード")
 
-# 起動を軽くするため、重い在庫サマリ(04_在庫管理: TODAY()採算の再計算で数十秒)は
-# 起動時に読み込まず、ボタン押下時のみ読む。これによりクラウド起動タイムアウトを回避。
-if not st.session_state.get("_home_dashboard_load"):
-    if st.button("📊 在庫サマリを表示", type="primary"):
-        st.session_state["_home_dashboard_load"] = True
-        st.rerun()
-    st.info("起動を軽くするため、在庫サマリは手動表示にしています。上のボタンで読み込めます（各ページは通常どおり使えます）。")
-    st.stop()
+# 04_在庫管理はTODAY()依存の重い数式で読込に8分半かかり起動を落とす。
+# 通常は家PCバッチが焼く数式ゼロの軽量スナップ(0.4秒)を読む。
+inv = sheets.load_inventory_snapshot()
 
-with st.spinner("データ読み込み中..."):
-    inv = sheets.load_inventory()
+if inv.empty:
+    # スナップ未生成(バッチ未実行) → 重い04直読はボタン押下時のみ(起動タイムアウト回避)
+    if not st.session_state.get("_home_dashboard_load"):
+        if st.button("📊 在庫サマリを表示（直読み・数分）", type="primary"):
+            st.session_state["_home_dashboard_load"] = True
+            st.rerun()
+        st.info("在庫スナップがまだありません（家PCのバッチ未実行）。上のボタンで直接読めますが数分かかります。各ページは通常どおり使えます。")
+        st.stop()
+    with st.spinner("04_在庫管理を直読み中…（数分かかります）"):
+        inv = sheets.load_inventory()
 
 if inv.empty:
     st.warning("在庫データを取得できません")
