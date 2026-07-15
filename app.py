@@ -1,119 +1,315 @@
-"""
-在庫管理ツール Streamlit版 — Home ページ
+"""📱 モバイル棚卸 — 単機能アプリ (これ1画面だけ)
 
-サイドバーの pages/ から各機能ページに遷移
-"""
-import os
+このデプロイアプリは「棚卸」専用。小分類順にSKUの実カウント数を入力 → 04の
+G列(月初在庫)を逆算して 自社倉庫(F) が実カウントと一致するよう反映する。
 
+他の分析ページ(売上集計・月次サマリ等)は Streamlit Cloud 無料枠の
+メモリ超過(Oh no.)の原因になるため撤去し、家PC/事務所のフル版に集約した。
+
+逆算ロジック(列移設に強い):
+  F = G + (I - J - 当月売上 - Z - S)  ← G以外はGに依存しない
+  よって G_new = G_old + (実カウント - 現在のF) とすれば F_new = 実カウント。
+"""
 import streamlit as st
+import pandas as pd
 
-from lib import sheets, ui
+from lib import sheets
 
-_PAGES_DIR = os.path.dirname(os.path.abspath(__file__))
+st.set_page_config(page_title="モバイル棚卸", page_icon="📱", layout="centered")
+
+st.markdown("""
+<style>
+    .stButton>button {
+        height: 52px !important;
+        font-size: 18px !important;
+        font-weight: 700 !important;
+    }
+    .stTextInput input, .stNumberInput input {
+        font-size: 18px !important;
+        height: 46px !important;
+    }
+    /* 反映(送信)ボタンを画面左下に常駐させる。
+       右下はStreamlit CloudのManage appボタンと重なるため左下に配置 */
+    div[data-testid="stFormSubmitButton"] {
+        position: fixed;
+        bottom: 24px;
+        left: 16px;
+        z-index: 9999;
+        width: auto !important;
+    }
+    div[data-testid="stFormSubmitButton"] button {
+        height: 52px !important;
+        font-size: 17px !important;
+        font-weight: 700 !important;
+        border-radius: 28px !important;
+        padding: 0 22px !important;
+        box-shadow: 0 4px 14px rgba(0,0,0,0.35);
+    }
+</style>
+""", unsafe_allow_html=True)
+
+st.title("📱 モバイル棚卸")
+st.caption("小分類順に実在庫を入力 → 自社倉庫に反映")
+
+# 最新化(軽量)。フル版のような全シートナビは撤去し、必要な再読込だけ残す。
+if st.button("🔄 データを最新化", help="在庫スナップを取り直します"):
+    st.cache_data.clear()
+    sheets._invalidate_one("04_在庫スナップ")
+    st.rerun()
 
 
-def _plink(path: str, label: str, **kw) -> None:
-    """対象ページが存在する時だけ st.page_link を描画(クラウドで未配置のページを安全にスキップ)。"""
-    if os.path.exists(os.path.join(_PAGES_DIR, path)):
-        st.page_link(path, label=label, **kw)
+def _f(v):
+    try:
+        return int(float(str(v).replace(",", "").replace("¥", "").strip() or 0))
+    except (ValueError, TypeError):
+        return 0
 
-st.set_page_config(
-    page_title="在庫管理ツール",
-    page_icon="📦",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
 
-st.title("📦 在庫管理ツール")
-st.caption("Streamlit + Google Sheets / GAS版とデータ同期")
+# 04_在庫管理はTODAY()依存の重い数式で読込に8分半かかる。表示用は家PCバッチが焼く
+# 数式ゼロの軽量スナップ(0.4秒)を読む(小分類/販売チャネルもスナップ列に同梱)。
+# スナップ未生成時のみ、重い04直読み+マスタにフォールバック。
+with st.spinner("読込中..."):
+    try:
+        inv_df = sheets.load_inventory_snapshot()
+    except Exception:
+        inv_df = pd.DataFrame()
+    from_snapshot = not inv_df.empty
+    if not from_snapshot:
+        st.info("⏳ 在庫スナップ未生成のため04を直読みします（数分かかることがあります）")
+        try:
+            inv_df = sheets.load_inventory()
+        except Exception as e:
+            st.error("📡 在庫データの取得に失敗しました（サーバー混雑かも）。")
+            st.caption(f"詳細: {type(e).__name__}")
+            if st.button("🔄 もう一度読み込む"):
+                sheets._invalidate_one("04_在庫管理")
+                st.rerun()
+            st.stop()
+        # フォールバック時のみ小分類/チャネルをマスタから補う
+        try:
+            master_df = sheets.load_master()
+        except Exception:
+            master_df = pd.DataFrame()
+            st.warning("⚠ 小分類を取得できませんでした（サーバー混雑）。並びは小分類なしになります。")
 
-ui.sidebar_common()
-
-# 全シートプリロードは「⚡ ツール」の手動ボタンから実行する運用に変更
-# (起動時の自動プリロードは API レート制限を圧迫するためスキップ)
-
-# ===========================================================
-# 全体サマリ
-# ===========================================================
-st.markdown("## 📊 ダッシュボード")
-
-# 04_在庫管理はTODAY()依存の重い数式で読込に8分半かかり起動を落とす。
-# 通常は家PCバッチが焼く数式ゼロの軽量スナップ(0.4秒)を読む。
-inv = sheets.load_inventory_snapshot()
-
-if inv.empty:
-    # スナップ未生成(バッチ未実行) → 重い04直読はボタン押下時のみ(起動タイムアウト回避)
-    if not st.session_state.get("_home_dashboard_load"):
-        if st.button("📊 在庫サマリを表示（直読み・数分）", type="primary"):
-            st.session_state["_home_dashboard_load"] = True
-            st.rerun()
-        st.info("在庫スナップがまだありません（家PCのバッチ未実行）。上のボタンで直接読めますが数分かかります。各ページは通常どおり使えます。")
-        st.stop()
-    with st.spinner("04_在庫管理を直読み中…（数分かかります）"):
-        inv = sheets.load_inventory()
-
-if inv.empty:
-    st.warning("在庫データを取得できません")
+if inv_df.empty:
+    st.error("在庫データ読込失敗")
     st.stop()
 
-# ステータス列を探す（X列=index23, 2026-06-02 移設で T→X）
-status_col = None
-candidates = ["ステータス"]
-if len(inv.columns) > 23:
-    candidates.append(inv.columns[23])
-for c in candidates:
-    if c in inv.columns:
-        status_col = c
-        break
+code_col = inv_df.columns[0]
+title_col = inv_df.columns[1] if len(inv_df.columns) > 1 else code_col
 
-# メトリクス
-col1, col2, col3, col4, col5 = st.columns(5)
-col1.metric("📦 総SKU数", f"{len(inv):,}")
+# フォールバック(重い04直読)時: 商品コード→小分類(マスタE=idx4)/販売チャネル(F=idx5)
+small_map = {}
+channel_map = {}
+if not from_snapshot:
+    if not master_df.empty and len(master_df.columns) > 4:
+        for c, s in zip(master_df.iloc[:, 0].astype(str).str.strip(),
+                        master_df.iloc[:, 4].astype(str)):
+            if c:
+                small_map[c] = s.strip()
+    if not master_df.empty and len(master_df.columns) > 5:
+        for c, ch in zip(master_df.iloc[:, 0].astype(str).str.strip(),
+                         master_df.iloc[:, 5].astype(str)):
+            if c:
+                channel_map[c] = ch.strip()
 
-if status_col:
-    counts = inv[status_col].value_counts()
-    col2.metric("🔴 危険", int(counts.get("🔴危険", 0)))
-    col3.metric("🟠 要発注", int(counts.get("🟠要発注", 0)))
-    col4.metric("🟣 過剰", int(counts.get("🟣過剰", 0)))
-    col5.metric("⚫ 在庫切れ", int(counts.get("⚫在庫切れ", 0)))
+# 在庫行 → 作業用テーブル
+#  - Amazon専売(AMA専売) は自社倉庫に無いので除外
+#  - 小分類なし(マスタ未登録)は終売とみなし除外。ただし小分類が全く取れない時は
+#    全行が小分類なし扱いになり全滅するため、その時は除外しない
+# 自分がこのセッションで反映した値を覚えておく {sku: (F, G)}。
+# F列はARRAYFORMULA(計算値)で、Gを書いた直後の再読込では古い値が返ることがあり、
+# それを基準にすると2回目の反映が「変化なし」とスキップされてしまう。
+# そこで自分の反映済み値があればそれを現在値として使う。
+applied = st.session_state.setdefault("mob_applied", {})
+
+if from_snapshot:
+    have_small = ("小分類" in inv_df.columns
+                  and inv_df["小分類"].astype(str).str.strip().ne("").any())
+else:
+    have_small = bool(small_map)
+
+rows = []
+for _, r in inv_df.iterrows():
+    code = str(r[code_col]).strip()
+    if not code:
+        continue
+    if from_snapshot:
+        channel = str(r.get("販売チャネル", "")).strip()
+        small = str(r.get("小分類", "")).strip()
+        f_sheet = _f(r.get("自社倉庫", 0))   # 自社倉庫(スナップ焼付値)
+        g_sheet = _f(r.get("月初在庫", 0))   # 月初在庫(スナップ焼付値)
+    else:
+        channel = channel_map.get(code, "")
+        small = small_map.get(code, "")
+        f_sheet = _f(r.iloc[5]) if len(r) > 5 else 0   # F 自社倉庫(計算値)
+        g_sheet = _f(r.iloc[6]) if len(r) > 6 else 0   # G 月初在庫(直接値)
+    if channel == "AMA専売":
+        continue
+    if have_small and not small:
+        continue  # 小分類なし=終売とみなし非表示
+    f_cur, g_cur = applied.get(code, (f_sheet, g_sheet))
+    rows.append({
+        "小分類": small,
+        "SKU": code,
+        "_G": g_cur,
+        "現在庫": f_cur,
+    })
+work = pd.DataFrame(rows)
+
+# 絞り込み（小分類・SKUとも文字入力で検索）
+sc1, sc2 = st.columns(2)
+small_kw = sc1.text_input("🔍 小分類検索", "", key="mob_count_small_kw",
+                          placeholder="小分類の一部")
+kw = sc2.text_input("🔍 SKU検索", "", key="mob_count_kw", placeholder="SKUの一部")
+
+view = work.copy()
+if small_kw.strip():
+    view = view[view["小分類"].str.contains(small_kw, case=False, na=False)]
+if kw.strip():
+    view = view[view["SKU"].str.contains(kw, case=False, na=False)]
+
+# 小分類 昇順 → SKU 昇順(上る順)
+view = view.sort_values(["小分類", "SKU"], ascending=[True, True]).reset_index(drop=True)
+
+if view.empty:
+    st.warning("該当SKUなし")
+    st.stop()
+
+# data_editorはスマホで数値が累積・消せない不具合があるため、st.formの
+# 行ごとnumber_inputに変更。formは送信ボタンを押すまで再実行しないので、
+# 入力途中で数字が勝手に足される/消せない問題が起きない。
+# 件数が多いと重いので200件ずつページ送り。ページ内で入力→反映を繰り返す。
+PAGE_SIZE = 200
+total = len(view)
+n_pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
+if n_pages > 1:
+    page = st.selectbox(
+        "ページ (200件ずつ)",
+        list(range(1, n_pages + 1)),
+        format_func=lambda p: f"{p}/{n_pages}ページ "
+                              f"({(p-1)*PAGE_SIZE+1}〜{min(p*PAGE_SIZE, total)}件)",
+        key="mob_count_page",
+    )
+else:
+    page = 1
+start = (page - 1) * PAGE_SIZE
+view_page = view.iloc[start:start + PAGE_SIZE].reset_index(drop=True)
+
+# 入力方法。棚→バッファのように2回に分けて数える時は「加算」を使う
+mode = st.radio(
+    "入力方法",
+    ["置き換え（数えた実数）", "加算（今の在庫に足す）"],
+    horizontal=True,
+    key="mob_count_mode",
+    help="棚を先に数えて反映 → 次にバッファを数える時は『加算』にすると、"
+         "入力した数が今の在庫に足されます",
+)
+add_mode = mode.startswith("加算")
+
+if add_mode:
+    st.caption(f"全{total}件中 {start+1}〜{min(start+PAGE_SIZE, total)}件目　"
+               "🟢加算モード：入力した数を今の在庫に足します(空欄・0はスキップ)。"
+               "ページを変える前に反映を押してください")
+else:
+    st.caption(f"全{total}件中 {start+1}〜{min(start+PAGE_SIZE, total)}件目　"
+               "置き換えモード：入力した実数に在庫を合わせます(空欄はスキップ)。"
+               "ページを変える前に反映を押してください")
+
+gmap = dict(zip(view_page["SKU"], view_page["_G"]))
+fmap = dict(zip(view_page["SKU"], view_page["現在庫"]))
+
+# clear_on_submit=True: 反映するたびに入力欄を空にする。
+# (Falseだと前回の数字が残り、もう一度押すと再適用=加算モードで二重に足される)
+# ※clear_on_submit時は number_input に key を付けてはいけない。
+#   key付きだと送信時に session_state クリアと戻り値取得が競合し、
+#   再入力した値が None 扱いになって反映されない。戻り値だけで受け取る。
+inputs = {}
+with st.form("mob_count_form", clear_on_submit=True):
+    for _, row in view_page.iterrows():
+        sku = row["SKU"]
+        f_old = int(row["現在庫"])
+        small = row["小分類"] or "（小分類なし）"
+        label = (f"{small}　|　{sku}　(現在 {f_old}) ＋足す数"
+                 if add_mode else f"{small}　|　{sku}　(現在 {f_old})")
+        inputs[sku] = st.number_input(
+            label,
+            min_value=0, step=1, value=None,
+        )
+    submitted = st.form_submit_button(
+        "💾 反映", type="primary", use_container_width=False)
+
+if submitted:
+    # 入力値を集計して逆算
+    #  置き換え: newc=目標実数 → F_new=newc  (空欄/現在庫と同値はスキップ)
+    #  加算    : newc=足す数  → F_new=f_old+newc (空欄/0はスキップ)
+    # どちらも G_new = G_old + (F_new - F_old)
+    changes = []
+    for sku in view_page["SKU"]:
+        newc = inputs.get(sku)
+        if newc is None:
+            continue
+        newc = int(newc)
+        f_old = int(fmap.get(sku, 0))
+        if add_mode:
+            if newc == 0:
+                continue
+            f_new = f_old + newc
+        else:
+            if newc == f_old:
+                continue
+            f_new = newc
+        g_new = int(gmap.get(sku, 0)) + (f_new - f_old)
+        changes.append((sku, f_new, g_new))
+
+    if not changes:
+        st.info("入力された変更がありません(空欄・置換で同値・加算で0のみ)")
+    else:
+        try:
+            ss = sheets.get_spreadsheet()
+            ws = ss.worksheet("04_在庫管理")
+            codes = ws.col_values(1)
+            row_of = {}
+            for i, c in enumerate(codes, start=1):
+                if i >= 7 and c.strip():
+                    row_of.setdefault(c.strip(), i)
+            reqs, miss = [], []
+            for sku, f_new, g_new in changes:
+                r_idx = row_of.get(sku)
+                if not r_idx:
+                    miss.append(sku)
+                    continue
+                reqs.append({"range": f"G{r_idx}", "values": [[g_new]]})
+                # 反映済みの値を記憶(F列の計算遅延に左右されず次回比較できるように)
+                applied[sku] = (f_new, g_new)
+            if reqs:
+                sheets.safe_batch_update(ws, reqs, value_input_option="USER_ENTERED")
+                sheets._invalidate_one("04_在庫管理")
+            st.success(
+                f"✅ {len(reqs)}件反映。自社倉庫(F)が実カウントに一致します"
+                + (f" / ⚠未マッチ {len(miss)}件" if miss else "")
+            )
+            st.balloons()
+        except Exception as e:
+            st.error(f"反映失敗: {e}")
+
+# 下部のページ遷移(スクロールし切った場所からでも移動できるように)
+if n_pages > 1:
+    st.markdown("---")
+    st.caption(f"ページ {page}/{n_pages}　※移動前に「反映」を押してください(未反映の入力は消えます)")
+    pcol1, pcol2, pcol3 = st.columns([1, 1, 1])
+    if pcol1.button("◀ 前へ", use_container_width=True,
+                    disabled=page <= 1, key="mob_count_prev"):
+        st.session_state["mob_count_page"] = page - 1
+        st.rerun()
+    pcol2.markdown(
+        f"<div style='text-align:center;line-height:52px;font-weight:700;'>"
+        f"{page} / {n_pages}</div>", unsafe_allow_html=True)
+    if pcol3.button("次へ ▶", use_container_width=True,
+                    disabled=page >= n_pages, key="mob_count_next"):
+        st.session_state["mob_count_page"] = page + 1
+        st.rerun()
 
 st.markdown("---")
-
-# ===========================================================
-# クイックリンク
-# ===========================================================
-st.markdown("## 📱 スマホ用ページ")
-st.caption("スマホはこの3つだけでOK")
-_plink("pages/40_📱_モバイル棚卸.py", "📱 棚卸（在庫を入力）", use_container_width=True)
-_plink("pages/41_📱_モバイル発注チェック.py", "📱 推奨発注数・発注済み", use_container_width=True)
-_plink("pages/44_📱_モバイル到着納品.py", "📱 発注→到着→納品（見るだけ）", use_container_width=True)
-
-with st.expander("🖥 PC用ページ"):
-    _plink("pages/01_📋_在庫管理.py", "📋 在庫管理")
-    _plink("pages/02_💰_売上管理.py", "💰 売上管理")
-    _plink("pages/05_🛒_推奨発注リスト.py", "🛒 推奨発注リスト")
-    _plink("pages/43_📋_発注到着納品.py", "📋 発注→到着→納品")
-    _plink("pages/07_📈_月次サマリ.py", "📈 月次サマリ")
-
-# ===========================================================
-# 危険SKUのプレビュー
-# ===========================================================
-if status_col:
-    danger = inv[inv[status_col].isin(["🔴危険", "⚫在庫切れ"])]
-    if not danger.empty:
-        st.markdown("## ⚠️ 要注意SKU（危険・在庫切れ）")
-        st.caption(f"{len(danger)}件")
-        # 主要列だけ表示
-        show_cols = [c for c in [
-            inv.columns[0],     # A 商品コード
-            inv.columns[1] if len(inv.columns) > 1 else None,  # B タイトル
-            status_col,
-            "在庫日数" if "在庫日数" in inv.columns else None,
-            "推奨発注数" if "推奨発注数" in inv.columns else None,
-        ] if c]
-        st.dataframe(
-            danger[show_cols],
-            use_container_width=True,
-            hide_index=True,
-            height=300,
-        )
+st.caption("📌 実カウント=倉庫の実物数。入力した行だけが反映対象(空欄・現在庫と同じ値はスキップ)。Amazon専売(AMA専売)は自社倉庫に無いので非表示")
