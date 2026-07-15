@@ -158,7 +158,10 @@ def _values_to_df(all_values, header_row, data_start_row, auto_detect_keywords=N
 # ============================================================
 # シート別ロード関数（各々個別にキャッシュ）
 # ============================================================
-@st.cache_data(ttl=config.CACHE_TTL_SECONDS, show_spinner=False)
+# max_entries: 生の値リスト(最大級のメモリ占有)がシート種別ごとに無制限に溜まるのを防ぐ。
+# 上限超過で古いエントリからLRU破棄され、Cloud無料枠(~1GB)でのメモリ滞留→OOMを抑える。
+# アプリが同時に扱うシートは十数枚程度なので30で十分(超過分は再取得されるだけ・実害なし)。
+@st.cache_data(ttl=config.CACHE_TTL_SECONDS, show_spinner=False, max_entries=30)
 def _fetch_raw(sheet_name: str):
     """シート1枚を取得(メモリキャッシュのみ。ディスクキャッシュは使わない)
 
