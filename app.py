@@ -158,6 +158,23 @@ for _, r in inv_df.iterrows():
     })
 work = pd.DataFrame(rows)
 
+# 04_在庫管理 / 04_在庫スナップに同一SKUが複数行あると、同じlabelの
+# number_inputが複数生成されてStreamlitDuplicateElementIdになる。
+# 書込み側も同一SKUの先頭行を更新対象としているため、表示も先頭行へ統一する。
+duplicate_skus = (
+    work.loc[work["SKU"].duplicated(keep=False), "SKU"]
+    .drop_duplicates()
+    .tolist()
+)
+if duplicate_skus:
+    work = work.drop_duplicates(subset=["SKU"], keep="first").reset_index(drop=True)
+    examples = "、".join(duplicate_skus[:5])
+    suffix = "…" if len(duplicate_skus) > 5 else ""
+    st.warning(
+        f"⚠ 在庫データに重複SKUが{len(duplicate_skus)}件あります。"
+        f"画面では先頭行だけ表示します: {examples}{suffix}"
+    )
+
 # 絞り込み（小分類・SKUとも文字入力で検索）
 sc1, sc2 = st.columns(2)
 small_kw = sc1.text_input("🔍 小分類検索", "", key="mob_count_small_kw",
