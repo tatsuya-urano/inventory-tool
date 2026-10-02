@@ -415,6 +415,8 @@ def refresh_sheet(sheet_name: str):
     _fetch_raw.clear()
     if sheet_name == config.SHEET_INVENTORY:
         load_inventory.clear()
+    elif sheet_name == config.SHEET_INV_SNAPSHOT:
+        load_inventory_snapshot.clear()
     elif sheet_name == config.SHEET_SALES:
         load_sales.clear()
     elif sheet_name == config.SHEET_PRODUCT_MASTER:
@@ -432,6 +434,8 @@ def _invalidate_one(sheet_name: str):
     # ただし、書き込みされてないシートのload結果は変わらないので、load関数を個別clear
     if sheet_name == config.SHEET_INVENTORY:
         load_inventory.clear()
+    elif sheet_name == config.SHEET_INV_SNAPSHOT:
+        load_inventory_snapshot.clear()
     elif sheet_name == config.SHEET_SALES:
         load_sales.clear()
     elif sheet_name == config.SHEET_PRODUCT_MASTER:

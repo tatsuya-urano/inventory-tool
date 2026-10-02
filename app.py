@@ -10,10 +10,23 @@ G列(月初在庫)を逆算して 自社倉庫(F) が実カウントと一致す
   F = G + (I - J - 当月売上 - Z - S)  ← G以外はGに依存しない
   よって G_new = G_old + (実カウント - 現在のF) とすれば F_new = 実カウント。
 """
+from datetime import datetime
+import time
+import uuid
+
 import streamlit as st
 import pandas as pd
 
 from lib import sheets
+from lib import inventory_mutation_lock
+from lib.mobile_stocktake import (
+    find_prewrite_drift,
+    find_reservation_conflicts,
+    find_verification_mismatches,
+    index_live_rows,
+    inspect_live_row_issues,
+    plan_stocktake_updates,
+)
 
 st.set_page_config(page_title="モバイル棚卸", page_icon="📱", layout="centered")
 
@@ -53,7 +66,11 @@ st.caption("小分類順に実在庫を入力 → 自社倉庫に反映")
 
 # 最新化(軽量)。フル版のような全シートナビは撤去し、必要な再読込だけ残す。
 if st.button("🔄 データを最新化", help="在庫スナップを取り直します"):
+    # セッション内の反映済み値も捨てる。これを残すとスナップを最新化しても
+    # 古い手元値が優先され、別PCの変更を画面に出せない。
+    st.session_state.pop("mob_applied", None)
     st.cache_data.clear()
+    sheets._invalidate_one("04_在庫管理")
     sheets._invalidate_one("04_在庫スナップ")
     st.rerun()
 
@@ -63,6 +80,47 @@ def _f(v):
         return int(float(str(v).replace(",", "").replace("¥", "").strip() or 0))
     except (ValueError, TypeError):
         return 0
+
+
+def _read_live_inventory(ws, last_row: int):
+    """04_在庫管理 A:G をキャッシュを通さずライブ取得する。"""
+    rows = ws.get(
+        f"A7:G{last_row}",
+        value_render_option="UNFORMATTED_VALUE",
+    )
+    duplicates, invalid = inspect_live_row_issues(rows)
+    return index_live_rows(rows, start_row=7), duplicates, invalid
+
+
+def _reserve_stocktake(log_ws, changes, batch_id: str, now: datetime):
+    """共有ログに予約をappendし、同じSKUの最初の予約だけを通す。"""
+    timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
+    rows = [
+        [
+            timestamp,
+            "モバイル棚卸予約",
+            change.sku,
+            f"変更前F:{change.f_before} G:{change.g_before}",
+            f"予定F:{change.f_after} G:{change.g_after}",
+            f"{batch_id}:{seq:03d}",
+            "予約中",
+            "5分で自動失効",
+        ]
+        for seq, change in enumerate(changes, start=1)
+    ]
+    log_ws.append_rows(rows, value_input_option="USER_ENTERED")
+    # row_count は空の予約行を含むグリッド総数なので、実際の最終ログ行を使う。
+    last_row = max(len(log_ws.col_values(1)), 2)
+    recent = log_ws.get(
+        f"A{max(2, last_row - 5000)}:H{last_row}",
+        value_render_option="FORMATTED_VALUE",
+    )
+    return find_reservation_conflicts(
+        recent,
+        batch_id,
+        [change.sku for change in changes],
+        now=now,
+    )
 
 
 # 04_在庫管理はTODAY()依存の重い数式で読込に8分半かかる。表示用は家PCバッチが焼く
@@ -235,7 +293,6 @@ else:
                "ページを変える前に反映を押してください")
 
 gmap = dict(zip(view_page["SKU"], view_page["_G"]))
-fmap = dict(zip(view_page["SKU"], view_page["現在庫"]))
 
 # clear_on_submit=True: 反映するたびに入力欄を空にする。
 # (Falseだと前回の数字が残り、もう一度押すと再適用=加算モードで二重に足される)
@@ -258,58 +315,285 @@ with st.form("mob_count_form", clear_on_submit=True):
         "💾 反映", type="primary", use_container_width=False)
 
 if submitted:
-    # 入力値を集計して逆算
-    #  置き換え: newc=目標実数 → F_new=newc  (空欄/現在庫と同値はスキップ)
-    #  加算    : newc=足す数  → F_new=f_old+newc (空欄/0はスキップ)
-    # どちらも G_new = G_old + (F_new - F_old)
-    changes = []
+    # 画面を開いた後に売上・月次繰越・別PCの棚卸が動く可能性があるため、
+    # ここでは入力値だけを回収する。逆算は必ず送信時のライブ F/G で行う。
+    entries = []
     for sku in view_page["SKU"]:
         newc = inputs.get(sku)
         if newc is None:
             continue
         newc = int(newc)
-        f_old = int(fmap.get(sku, 0))
-        if add_mode:
-            if newc == 0:
-                continue
-            f_new = f_old + newc
-        else:
-            if newc == f_old:
-                continue
-            f_new = newc
-        g_new = int(gmap.get(sku, 0)) + (f_new - f_old)
-        changes.append((sku, f_new, g_new))
+        if add_mode and newc == 0:
+            continue
+        entries.append((sku, newc))
 
-    if not changes:
+    if not entries:
         st.info("入力された変更がありません(空欄・置換で同値・加算で0のみ)")
     else:
+        global_inventory_lock = None
         try:
             ss = sheets.get_spreadsheet()
+            # 月締め・入荷・FBA移動・別端末棚卸と同じ共有ロックを使う。
+            # 取得できない場合はライブ値を読む前に停止し、古い差分を作らない。
+            global_inventory_lock = (
+                inventory_mutation_lock.acquire_inventory_mutation_lock(
+                    ss, purpose="公開モバイル棚卸", ttl_seconds=600,
+                )
+            )
             ws = ss.worksheet("04_在庫管理")
             codes = ws.col_values(1)
-            row_of = {}
-            for i, c in enumerate(codes, start=1):
-                if i >= 7 and c.strip():
-                    row_of.setdefault(c.strip(), i)
-            reqs, miss = [], []
-            for sku, f_new, g_new in changes:
-                r_idx = row_of.get(sku)
-                if not r_idx:
-                    miss.append(sku)
-                    continue
-                reqs.append({"range": f"G{r_idx}", "values": [[g_new]]})
-                # 反映済みの値を記憶(F列の計算遅延に左右されず次回比較できるように)
-                applied[sku] = (f_new, g_new)
-            if reqs:
-                sheets.safe_batch_update(ws, reqs, value_input_option="USER_ENTERED")
-                sheets._invalidate_one("04_在庫管理")
-            st.success(
-                f"✅ {len(reqs)}件反映。自社倉庫(F)が実カウントに一致します"
-                + (f" / ⚠未マッチ {len(miss)}件" if miss else "")
+            last_row = max(len(codes), 7)
+            live_before, duplicate_skus, invalid_skus = _read_live_inventory(ws, last_row)
+            plan = plan_stocktake_updates(
+                entries,
+                gmap,
+                live_before,
+                add_mode=add_mode,
+                blocked_skus=set(duplicate_skus) | set(invalid_skus),
             )
-            st.balloons()
+
+            # 1件でも G が表示時から変わっていたら全件停止する。
+            # 一部だけ書くと、利用者がどこまで反映されたか判断できず再入力で重複する。
+            if plan.conflicts or plan.missing:
+                details = []
+                duplicate_targets = [
+                    sku for sku in plan.conflicts if sku in set(duplicate_skus)
+                ]
+                invalid_targets = [
+                    sku for sku in plan.conflicts if sku in set(invalid_skus)
+                ]
+                ordinary_conflicts = [
+                    sku for sku in plan.conflicts
+                    if sku not in set(duplicate_skus) and sku not in set(invalid_skus)
+                ]
+                if duplicate_targets:
+                    details.append(
+                        "SKU重複 " + "、".join(duplicate_targets[:10])
+                        + ("…" if len(duplicate_targets) > 10 else "")
+                    )
+                if invalid_targets:
+                    details.append(
+                        "F/G数式・数値エラー " + "、".join(invalid_targets[:10])
+                        + ("…" if len(invalid_targets) > 10 else "")
+                    )
+                if ordinary_conflicts:
+                    details.append(
+                        "表示後のG変更 " + "、".join(ordinary_conflicts[:10])
+                        + ("…" if len(ordinary_conflicts) > 10 else "")
+                    )
+                if plan.missing:
+                    details.append(
+                        "未登録 " + "、".join(plan.missing[:10])
+                        + ("…" if len(plan.missing) > 10 else "")
+                    )
+                st.error(
+                    "安全確認を通過しなかったため全件の反映を停止しました。"
+                    "表示後の変更は『データを最新化』後に再入力し、重複や数式エラーは"
+                    "在庫管理シートを修正してください。\n\n"
+                    + " / ".join(details)
+                )
+            elif not plan.changes:
+                st.info("送信時の最新在庫と同じため、変更はありません")
+            else:
+                batch_id = (
+                    "MOB-"
+                    + datetime.now().strftime("%Y%m%d%H%M%S")
+                    + "-"
+                    + uuid.uuid4().hex[:12]
+                )
+                log_ws = ss.worksheet("08_ログ履歴")
+                reservation_conflicts = _reserve_stocktake(
+                    log_ws, plan.changes, batch_id, datetime.now()
+                )
+                if reservation_conflicts:
+                    stop_rows = [
+                        [
+                            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            "モバイル棚卸",
+                            change.sku,
+                            "",
+                            "",
+                            f"{batch_id}:{seq:03d}",
+                            "競合停止",
+                            "別端末の先行予約あり",
+                        ]
+                        for seq, change in enumerate(plan.changes, start=1)
+                    ]
+                    log_ws.append_rows(stop_rows, value_input_option="USER_ENTERED")
+                    st.error(
+                        "別端末の棚卸と重なったため、書き込まず停止しました。"
+                        "5分後に『データを最新化』して再入力してください。対象: "
+                        + "、".join(reservation_conflicts[:10])
+                    )
+                    st.stop()
+
+                # 予約判定の直前に別端末が完了した場合、その端末の予約は既に
+                # 終端扱いとなる。そこで予約を取った直後にもう一度F/Gを読み、
+                # 計画作成時の値と同じことを確認してから書く（CAS相当）。
+                locked_live, locked_duplicates, locked_invalid = _read_live_inventory(
+                    ws, last_row
+                )
+                prewrite_drift = find_prewrite_drift(
+                    plan.changes,
+                    locked_live,
+                    blocked_skus=set(locked_duplicates) | set(locked_invalid),
+                )
+                if prewrite_drift:
+                    stop_rows = []
+                    stopped_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    for seq, change in enumerate(plan.changes, start=1):
+                        actual = locked_live.get(change.sku)
+                        actual_text = (
+                            f"現在F:{actual.f_value} G:{actual.g_value}"
+                            if actual is not None else "現在行なし"
+                        )
+                        stop_rows.append([
+                            stopped_at,
+                            "モバイル棚卸",
+                            change.sku,
+                            f"変更前F:{change.f_before} G:{change.g_before}",
+                            actual_text,
+                            f"{batch_id}:{seq:03d}",
+                            "競合停止",
+                            "予約取得後のライブ値変化",
+                        ])
+                    log_ws.append_rows(stop_rows, value_input_option="USER_ENTERED")
+                    st.error(
+                        "予約中に在庫が変わったため、書き込まず停止しました。"
+                        "『データを最新化』して再入力してください。対象: "
+                        + "、".join(prewrite_drift[:10])
+                    )
+                    st.stop()
+
+                reqs = [
+                    {"range": f"G{c.row_index}", "values": [[c.g_after]]}
+                    for c in plan.changes
+                ]
+                written = sheets.safe_batch_update(
+                    ws, reqs, value_input_option="USER_ENTERED"
+                )
+                if written != len(reqs):
+                    raise RuntimeError(
+                        f"在庫書込件数が一致しません（予定{len(reqs)} / 実行{written}）"
+                    )
+                sheets._invalidate_one("04_在庫管理")
+
+                # ARRAYFORMULA の再計算を待ち、F/G の両方をライブ値で照合する。
+                # Gだけ書けてFが目標値にならない状態は成功扱いにしない。
+                live_after = {}
+                duplicate_after = ()
+                invalid_after = ()
+                mismatches = tuple(c.sku for c in plan.changes)
+                for attempt in range(5):
+                    live_after, duplicate_after, invalid_after = _read_live_inventory(
+                        ws, last_row
+                    )
+                    mismatches = find_verification_mismatches(
+                        plan.changes,
+                        live_after,
+                        blocked_skus=set(duplicate_after) | set(invalid_after),
+                    )
+                    if not mismatches:
+                        break
+                    if attempt < 4:
+                        time.sleep(1.5)
+
+                verified = not mismatches
+                status = "完了" if verified else "検証失敗"
+                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                audit_rows = []
+                for seq, change in enumerate(plan.changes, start=1):
+                    actual = live_after.get(change.sku)
+                    actual_result = (
+                        f"F:{actual.f_value} G:{actual.g_value}"
+                        if actual is not None else "行なし"
+                    )
+                    audit_rows.append([
+                        now,
+                        "モバイル棚卸",
+                        change.sku,
+                        (
+                            f"{change.mode}入力:{change.input_value} / "
+                            f"変更前F:{change.f_before} G:{change.g_before}"
+                        ),
+                        (
+                            f"予定F:{change.f_after} G:{change.g_after} / "
+                            f"実測{actual_result}"
+                        ),
+                        f"{batch_id}:{seq:03d}",
+                        status,
+                        "送信時ライブ再読込・書込後照合",
+                    ])
+
+                audit_error = None
+                try:
+                    sheets.append_rows("08_ログ履歴", audit_rows)
+                except Exception as exc:
+                    audit_error = exc
+
+                if not verified:
+                    examples = "、".join(mismatches[:10])
+                    st.error(
+                        "在庫を書き込みましたが、書込後のF/G照合に失敗したため"
+                        "成功扱いにしていません。再度ボタンを押さず、管理者へ"
+                        f"このIDを伝えてください: {batch_id} / SKU: {examples}"
+                    )
+                    if audit_error:
+                        st.error(f"監査ログも保存できませんでした: {audit_error}")
+                else:
+                    # 検証済みの値だけをセッション表示へ反映する。
+                    for change in plan.changes:
+                        applied[change.sku] = (change.f_after, change.g_after)
+
+                    # 表示用スナップも即時同期し、次の再読込で古い在庫へ戻さない。
+                    try:
+                        snap = ss.worksheet("04_在庫スナップ")
+                        snap_codes = snap.col_values(1)
+                        snap_row = {}
+                        for i, code in enumerate(snap_codes, start=1):
+                            code = str(code).strip()
+                            if code:
+                                snap_row.setdefault(code, i)
+                        snap_reqs = [
+                            {
+                                "range": f"C{snap_row[c.sku]}:D{snap_row[c.sku]}",
+                                "values": [[c.f_after, c.g_after]],
+                            }
+                            for c in plan.changes if c.sku in snap_row
+                        ]
+                        if snap_reqs:
+                            sheets.safe_batch_update(
+                                snap, snap_reqs, value_input_option="USER_ENTERED"
+                            )
+                        sheets._invalidate_one("04_在庫スナップ")
+                    except Exception as snap_error:
+                        st.warning(f"⚠ 表示用在庫の即時更新に失敗しました: {snap_error}")
+
+                    if audit_error:
+                        st.error(
+                            "在庫の照合は完了しましたが監査ログを保存できなかったため、"
+                            "成功表示を出していません。再度ボタンは押さないでください。"
+                            f" ID: {batch_id} / 詳細: {audit_error}"
+                        )
+                    else:
+                        st.success(
+                            f"✅ {len(plan.changes)}件反映・照合・履歴保存まで完了 "
+                            f"(ID: {batch_id})"
+                        )
+                        st.balloons()
         except Exception as e:
             st.error(f"反映失敗: {e}")
+        finally:
+            if global_inventory_lock is not None:
+                try:
+                    global_inventory_lock.release(note="公開モバイル棚卸終了")
+                except Exception as lock_error:
+                    # 在庫固有の予約・書込後照合は別に残るため再加算は防げる。
+                    # 共有ロックは期限で失効するが、利用者には明示する。
+                    st.warning(
+                        "共有在庫ロックの解放記録に失敗しました。"
+                        f"最大10分で自動失効します: {lock_error}"
+                    )
 
 # 下部のページ遷移(スクロールし切った場所からでも移動できるように)
 if n_pages > 1:
