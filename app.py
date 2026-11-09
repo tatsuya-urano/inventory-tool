@@ -30,6 +30,14 @@ from lib.mobile_stocktake import (
 
 st.set_page_config(page_title="モバイル棚卸", page_icon="📱", layout="centered")
 
+# 棚卸の実処理はVPSへ移行済み。旧Cloud URLから二重に在庫更新されないよう、
+# このアプリは移転案内だけを表示する。
+SERVER_MOBILE_URL = "https://mobile.133.18.181.11.nip.io/"
+st.title("📱 モバイル棚卸は移転しました")
+st.info("今後はサーバー版を使用してください。旧Cloud版から在庫は更新しません。")
+st.link_button("サーバー版モバイル棚卸を開く", SERVER_MOBILE_URL, use_container_width=True)
+st.stop()
+
 st.markdown("""
 <style>
     .stButton>button {

@@ -8,7 +8,9 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import os
+import re
 import socket
+import time
 from typing import Any, Iterator, Sequence
 import uuid
 
@@ -24,6 +26,8 @@ HEADERS = ("owner", "purpose", "status", "created_at", "expires_at", "released_a
 ACTIVE = "ACTIVE"
 RELEASED = "RELEASED"
 DEFAULT_TTL_SECONDS = 7200
+TRANSIENT_RETRY_DELAYS = (1, 2, 4, 8, 15)
+LOCK_READ_TAIL_ROWS = 5000
 
 
 class InventoryMutationLockError(RuntimeError):
@@ -63,16 +67,60 @@ def _row_values(row: Sequence[object]) -> list[str]:
     return values + [""] * (len(HEADERS) - len(values))
 
 
+def _is_retryable_error(exc: BaseException) -> bool:
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    text = str(exc).lower()
+    if status in {429, 500, 502, 503, 504}:
+        return True
+    return any(marker in text for marker in (
+        "quota exceeded", "429", "internal server error", "bad gateway",
+        "service unavailable", "gateway timeout", "connection reset",
+        "connection aborted", "timed out", "timeout", "temporarily unavailable",
+    ))
+
+
+def _with_retry(operation):
+    for attempt in range(len(TRANSIENT_RETRY_DELAYS) + 1):
+        try:
+            return operation()
+        except Exception as exc:
+            if not _is_retryable_error(exc) or attempt >= len(TRANSIENT_RETRY_DELAYS):
+                raise
+            time.sleep(TRANSIENT_RETRY_DELAYS[attempt])
+    raise AssertionError("unreachable")
+
+
 def _read_rows(ws: Any) -> list[list[str]]:
     try:
-        return [_row_values(row) for row in ws.get_all_values()]
+        if hasattr(ws, "batch_get") and hasattr(ws, "row_count"):
+            last_row = max(2, int(getattr(ws, "row_count", 2) or 2))
+            tail_start = max(2, last_row - LOCK_READ_TAIL_ROWS + 1)
+            blocks = _with_retry(lambda: ws.batch_get(
+                ["A1:H1", f"A{tail_start}:H"],
+                value_render_option="UNFORMATTED_VALUE",
+            ))
+            header = blocks[0][0] if blocks and blocks[0] else []
+            tail = blocks[1] if len(blocks) > 1 else []
+            rows = [header] + ([[]] * (tail_start - 2)) + list(tail)
+        else:
+            rows = _with_retry(ws.get_all_values)
+        return [_row_values(row) for row in rows]
     except Exception as exc:
         raise InventoryMutationLockError("共有在庫ロックを再読込できないため、在庫更新を中止します") from exc
 
 
+def _append_row_number(response: object) -> int | None:
+    if not isinstance(response, dict):
+        return None
+    updated_range = str(response.get("updates", {}).get("updatedRange", ""))
+    match = re.search(r"!A(\d+):H\d+$", updated_range)
+    return int(match.group(1)) if match else None
+
+
 def _update_row(ws: Any, row_number: int, values: Sequence[object]) -> None:
     try:
-        ws.update(range_name=f"A{row_number}:H{row_number}", values=[[str(value or "") for value in values]], value_input_option="RAW")
+        _with_retry(lambda: ws.update(range_name=f"A{row_number}:H{row_number}", values=[[str(value or "") for value in values]], value_input_option="RAW"))
     except Exception as exc:
         raise InventoryMutationLockError(f"共有在庫ロック行{row_number}を更新できません") from exc
 
@@ -87,14 +135,14 @@ def _write_header(ws: Any) -> None:
 def _ensure_worksheet(spreadsheet: Any) -> Any:
     created = False
     try:
-        ws = spreadsheet.worksheet(SHEET_NAME)
+        ws = _with_retry(lambda: spreadsheet.worksheet(SHEET_NAME))
     except WorksheetNotFound:
         try:
-            ws = spreadsheet.add_worksheet(title=SHEET_NAME, rows=2000, cols=len(HEADERS))
+            ws = _with_retry(lambda: spreadsheet.add_worksheet(title=SHEET_NAME, rows=2000, cols=len(HEADERS)))
             created = True
         except Exception:
             try:
-                ws = spreadsheet.worksheet(SHEET_NAME)
+                ws = _with_retry(lambda: spreadsheet.worksheet(SHEET_NAME))
             except Exception as read_exc:
                 raise InventoryMutationLockError("共有在庫ロック用シートを作成・取得できません") from read_exc
     except Exception as exc:
@@ -164,10 +212,20 @@ def acquire_inventory_mutation_lock(spreadsheet: Any, *, purpose: str, ttl_secon
     host = socket.gethostname()
     ws = _ensure_worksheet(spreadsheet)
     try:
-        ws.append_row([lock_owner, purpose, ACTIVE, _iso(acquired_at), _iso(expires_at), "", host, ""], value_input_option="RAW")
+        appended = [lock_owner, purpose, ACTIVE, _iso(acquired_at), _iso(expires_at), "", host, ""]
+        append_response = _with_retry(lambda: ws.append_row(appended, value_input_option="RAW"))
     except Exception as exc:
         raise InventoryMutationLockError("共有在庫ロックを予約できないため、在庫更新を中止します") from exc
-    rows = _read_rows(ws)
+    appended_row = _append_row_number(append_response)
+    try:
+        rows = _read_rows(ws)
+    except InventoryMutationLockError:
+        if appended_row is not None:
+            try:
+                _update_row(ws, appended_row, [*appended[:2], RELEASED, *appended[3:5], _iso(_utc_now()), host, "予約後の確認読込失敗を自動解除"])
+            except InventoryMutationLockError:
+                pass
+        raise
     records = [_record(row, index) for index, row in enumerate(rows[1:], start=2)]
     own_rows = [record for record in records if record.get("owner") == lock_owner]
     if len(own_rows) != 1 or own_rows[0].get("status") != ACTIVE:
@@ -199,4 +257,3 @@ def inventory_mutation_lock(spreadsheet: Any, *, purpose: str, ttl_seconds: int 
         raise
     else:
         lock.release(note="正常終了")
-
